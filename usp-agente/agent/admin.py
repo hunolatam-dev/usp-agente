@@ -12,17 +12,15 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from agent import avisos, conciliacion, importadores, memoria
+from agent import avisos, conciliacion, huno, importadores, memoria
 from agent.db import (
-    Cliente,
     Comprobante,
-    Contacto,
     Conversacion,
     Escalamiento,
-    Factura,
+    FacturaHuno,
     Movimiento,
     Pago,
     ahora,
@@ -78,38 +76,6 @@ async def subir_cartola(request: Request, archivo: UploadFile = File(...)):
     return {"importacion": res.dict(), "comprobantes_reevaluados": conteo, "avisos": aviso}
 
 
-@router.post("/admin/api/facturas", dependencies=[Depends(autorizar)])
-async def subir_facturas(archivo: UploadFile = File(...)):
-    res = await importadores.importar_facturas(await _leer(archivo), archivo.filename or "facturas.csv")
-    return {"importacion": res.dict()}
-
-
-@router.post("/admin/api/contactos/archivo", dependencies=[Depends(autorizar)])
-async def subir_contactos(archivo: UploadFile = File(...)):
-    res = await importadores.importar_contactos(await _leer(archivo), archivo.filename or "contactos.csv")
-    return {"importacion": res.dict()}
-
-
-class NuevoContacto(BaseModel):
-    telefono: str
-    rut: str
-    nombre: str | None = None
-    razon_social: str | None = None
-
-
-@router.post("/admin/api/contactos", dependencies=[Depends(autorizar)])
-async def crear_contacto(datos: NuevoContacto):
-    try:
-        creado = await importadores.agregar_contacto(datos.telefono, datos.rut, datos.nombre, datos.razon_social)
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
-    # Si tenia comprobantes esperando RUT, ahora se pueden asociar
-    from agent.utils import normalizar_telefono
-
-    reevaluados = await conciliacion.reevaluar_pendientes(normalizar_telefono(datos.telefono), estados=("esperando_rut",))
-    return {"creado": creado, "comprobantes_reevaluados": len(reevaluados)}
-
-
 # ── Consultas ────────────────────────────────────────────────────────────
 
 
@@ -126,11 +92,21 @@ async def resumen():
             "esperando_rut": await contar(Comprobante, Comprobante.estado == "esperando_rut"),
             "confirmados_24h": await contar(Comprobante, Comprobante.estado == "confirmado", Comprobante.actualizado_en >= hace_un_dia),
             "confirmados_sin_avisar": await contar(Comprobante, Comprobante.estado == "confirmado", Comprobante.notificado.is_(False)),
-            "facturas_pendientes": await contar(Factura, Factura.estado == "pendiente"),
+            "facturas_pendientes": await contar(FacturaHuno, or_(FacturaHuno.pagado.is_(None), FacturaHuno.pagado.is_(False))),
             "ultimo_movimiento": (await s.execute(select(func.max(Movimiento.fecha)))).scalar_one(),
-            "clientes": await contar(Cliente),
-            "contactos": await contar(Contacto),
+            "clientes_con_telefono": sum(1 for c in await huno.clientes(forzar=True) if c.telefonos),
         }
+
+
+@router.get("/admin/api/clientes", dependencies=[Depends(autorizar)])
+async def listar_clientes():
+    """Para revisar que telefonos reconoce el agente desde las fichas de app.huno.cl."""
+    lista = await huno.clientes(forzar=True)
+    return [
+        {"id": c.id, "nombre": c.nombre, "rut": c.rut,
+         "telefonos": [{"telefono": t, "nombre": n} for t, n in c.telefonos]}
+        for c in sorted(lista, key=lambda c: c.nombre.lower())
+    ]
 
 
 def _comp_dict(c: Comprobante) -> dict:
@@ -203,28 +179,31 @@ async def ver_archivo(cid: int):
 
 @router.get("/admin/api/candidatos/{cid}", dependencies=[Depends(autorizar)])
 async def candidatos(cid: int):
-    """Facturas y movimientos posibles para confirmar a mano un comprobante."""
+    """Facturas (Finanzas de app.huno.cl) y movimientos posibles para confirmar a mano."""
     async with async_session() as s:
         c = await s.get(Comprobante, cid)
         if c is None:
             raise HTTPException(404, "No existe")
-        ruts = await conciliacion.ruts_de_telefono(s, c.telefono)
-        conv = await s.get(Conversacion, c.telefono)
-        for extra in (c.rut_origen, conv.rut_declarado if conv else None):
-            if extra and extra not in ruts:
-                ruts.append(extra)
-        fq = select(Factura).where(Factura.estado == "pendiente")
-        fq = fq.where(Factura.rut.in_(ruts)) if ruts else (fq.where(Factura.saldo == c.monto) if c.monto else fq.where(False))
-        facturas = (await s.execute(fq.order_by(Factura.fecha_vencimiento).limit(50))).scalars().all()
+        clientes = await conciliacion.candidatos(s, c)
+        if clientes:
+            facturas = await huno.facturas_pendientes(s, [x.id for x in clientes])
+        elif c.monto:
+            # Cliente desconocido: se muestran las facturas pendientes con ese saldo exacto
+            todos = await huno.clientes()
+            facturas = [f for f in await huno.facturas_pendientes(s, [x.id for x in todos]) if f.saldo == c.monto]
+        else:
+            facturas = []
+        nombres = {x.id: x for x in await huno.clientes()}
         mq = select(Movimiento).where(Movimiento.disponible > 0)
         if c.monto:
             mq = mq.where(Movimiento.monto == c.monto)
         movs = (await s.execute(mq.order_by(Movimiento.fecha.desc()).limit(50))).scalars().all()
-        clientes = {r.rut: r.razon_social for r in (await s.execute(select(Cliente).where(Cliente.rut.in_({f.rut for f in facturas})))).scalars()}
         return {
-            "facturas": [{"id": f.id, "folio": f.folio, "rut": f.rut, "razon_social": clientes.get(f.rut),
+            "facturas": [{"id": f.id, "folio": f.folio, "rut": nombres[f.cliente_id].rut if f.cliente_id in nombres else None,
+                          "razon_social": nombres[f.cliente_id].nombre if f.cliente_id in nombres else None,
                           "saldo": f.saldo, "saldo_txt": formatear_monto(f.saldo),
-                          "vencimiento": f.fecha_vencimiento.isoformat() if f.fecha_vencimiento else None} for f in facturas],
+                          "vencimiento": f.periodo or (f.fecha_emision.isoformat() if f.fecha_emision else None)}
+                         for f in facturas[:80]],
             "movimientos": [{"id": m.id, "fecha": m.fecha.isoformat(), "monto": m.monto, "monto_txt": formatear_monto(m.monto),
                              "disponible": m.disponible, "disponible_txt": formatear_monto(m.disponible),
                              "descripcion": m.descripcion, "documento": m.documento} for m in movs],
@@ -239,42 +218,44 @@ class ConfirmacionManual(BaseModel):
 
 @router.post("/admin/api/comprobantes/{cid}/confirmar", dependencies=[Depends(autorizar)])
 async def confirmar_manual(cid: int, datos: ConfirmacionManual, request: Request, quien: str = Depends(usuario)):
-    """Un ejecutivo confirma a mano (ej. pago parcial o de varias facturas se resuelve factura por factura)."""
+    """
+    Un ejecutivo aplica un movimiento del banco a una factura de Finanzas. Si no cubre el
+    saldo queda como abono; un pago de varias facturas se registra una por una.
+    """
     async with async_session() as s:
         c = await s.get(Comprobante, cid)
-        f = await s.get(Factura, datos.factura_id)
         m = await s.get(Movimiento, datos.movimiento_id)
+        f, saldo = await huno.saldo_bloqueado(s, datos.factura_id)
         if not c or not f or not m:
             raise HTTPException(404, "Comprobante, factura o movimiento no existe")
-        if f.estado != "pendiente":
-            raise HTTPException(409, "La factura no esta pendiente")
-        aplicar = min(f.saldo, m.disponible)
+        if f.pagado or saldo <= 0:
+            raise HTTPException(409, "La factura ya esta pagada")
+        aplicar = min(saldo, m.disponible)
         if aplicar <= 0:
             raise HTTPException(409, "Ese movimiento del banco ya fue usado por completo")
         try:
             rm = await s.execute(update(Movimiento).where(Movimiento.id == m.id, Movimiento.disponible >= aplicar)
                                  .values(disponible=Movimiento.disponible - aplicar))
-            rf = await s.execute(update(Factura).where(Factura.id == f.id, Factura.saldo == f.saldo).values(
-                saldo=f.saldo - aplicar, estado="pagada" if f.saldo == aplicar else "pendiente", actualizado_en=ahora()))
-            if rm.rowcount != 1 or rf.rowcount != 1:
+            ok, nuevo_saldo = await huno.aplicar_pago(s, f.id, aplicar, m.fecha, f"{quien} (agente USP)")
+            if rm.rowcount != 1 or not ok:
                 raise IntegrityError("cambio concurrente", None, None)
             s.add(Pago(factura_id=f.id, movimiento_id=m.id, comprobante_id=c.id, monto=aplicar, origen="manual",
                        registrado_por=quien))
-            nuevo_saldo = f.saldo - aplicar
             c.estado, c.factura_id, c.movimiento_id, c.motivo = "confirmado", f.id, m.id, f"manual: {quien}"
             c.actualizado_en = ahora()
             await s.commit()
         except IntegrityError as e:
             await s.rollback()
             raise HTTPException(409, "La factura o el movimiento cambio; recarga e intenta de nuevo") from e
-        # Cerrar los casos abiertos de ese comprobante
         await s.execute(update(Escalamiento).where(Escalamiento.comprobante_id == cid, Escalamiento.estado == "abierto")
                         .values(estado="resuelto", resuelto_en=ahora(), resuelto_por=quien, nota_resolucion="confirmado a mano"))
         await s.commit()
-        cliente = await s.get(Cliente, f.rut)
+        folio = huno.folio_de(f)
+        cliente = await huno.cliente_por_id(f.cliente_id) if f.cliente_id else None
     aviso = {"avisados": 0, "sin_avisar": 0}
     if datos.avisar_cliente:
-        r = conciliacion.Resultado("confirmado", "", aplicar, f.folio, cliente.razon_social if cliente else f.rut, f.rut)
+        r = conciliacion.Resultado("confirmado" if nuevo_saldo == 0 else "abono", "", aplicar, folio,
+                                   cliente.nombre if cliente else None, cliente.rut if cliente else None, saldo=nuevo_saldo)
         aviso = await avisos.avisar_confirmaciones(request.app.state.proveedor, [(c, r)])
     return {"ok": True, "saldo_restante": nuevo_saldo, "aviso": aviso}
 

@@ -1,8 +1,9 @@
-# agent/importadores.py — Carga de cartola BCI, facturas pendientes y contactos
+# agent/importadores.py — Carga de la cartola BCI
 """
 Acepta CSV (separado por ; o ,) y Excel (.xlsx). Las columnas se reconocen por nombre,
-sin importar mayusculas, tildes ni el orden, para tolerar los distintos formatos de
-exportacion de BCI Pyme y de Facto.
+sin importar mayusculas, tildes ni el orden, para tolerar los formatos de BCI Pyme.
+
+Clientes, telefonos y facturas NO se importan: se leen directo de app.huno.cl (agent/huno.py).
 """
 
 import csv
@@ -13,11 +14,9 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
-from agent.db import Cliente, Contacto, Factura, Movimiento, ahora, async_session
+from agent.db import Movimiento, async_session
 from agent.utils import (
     buscar_ruts,
-    normalizar_rut,
-    normalizar_telefono,
     parsear_fecha,
     parsear_monto,
     sin_tildes,
@@ -36,26 +35,6 @@ COL_CARTOLA = {
                   "n operacion", "nro operacion", "numero operacion", "serial", "n doc"],
     "saldo": ["saldo", "saldo diario", "saldo contable", "saldo disponible"],
 }
-COL_FACTURAS = {
-    "folio": ["folio", "n factura", "numero", "nro", "n documento", "nro factura", "numero factura", "n"],
-    "tipo": ["tipo", "tipo dte", "tipo documento", "dte"],
-    "rut": ["rut", "rut cliente", "rut receptor", "rut empresa"],
-    "razon_social": ["razon social", "cliente", "nombre", "receptor", "razon social receptor", "empresa"],
-    "monto": ["total", "monto", "monto total", "total factura", "valor"],
-    "saldo": ["saldo", "saldo pendiente", "por pagar", "pendiente"],
-    "emision": ["fecha", "emision", "fecha emision", "fecha documento"],
-    "vencimiento": ["vencimiento", "fecha vencimiento", "vence"],
-    "estado": ["estado", "estado pago"],
-    "email": ["email", "correo", "e-mail", "mail"],
-}
-COL_CONTACTOS = {
-    "telefono": ["telefono", "celular", "whatsapp", "fono", "movil"],
-    "rut": ["rut", "rut cliente", "rut empresa"],
-    "nombre": ["nombre", "contacto"],
-    "razon_social": ["razon social", "empresa", "cliente"],
-}
-
-
 @dataclass
 class ResultadoImportacion:
     leidos: int = 0
@@ -176,110 +155,4 @@ async def importar_cartola(contenido: bytes, nombre: str) -> ResultadoImportacio
             s.add(m)
             res.nuevos += 1
         await s.commit()
-    return res
-
-
-# ── Facturas ─────────────────────────────────────────────────────────────
-
-
-async def importar_facturas(contenido: bytes, nombre: str, origen: str = "facto") -> ResultadoImportacion:
-    """
-    Crea o actualiza facturas pendientes. Nunca "despaga" una factura que el agente ya
-    marco como pagada. Las facturas marcadas como pagadas en el archivo se marcan pagadas.
-    """
-    res = ResultadoImportacion()
-    filas = _filas(contenido, nombre)
-    try:
-        inicio, mapa = _buscar_cabecera(filas, COL_FACTURAS, {"folio", "rut", "monto"})
-    except ValueError as e:
-        res.errores.append(str(e))
-        return res
-
-    async with async_session() as s:
-        for n, fila in enumerate(filas[inicio + 1:], start=inicio + 2):
-            if not any(c not in (None, "") for c in fila):
-                continue
-            folio = str(_celda(fila, mapa, "folio") or "").strip()
-            if folio.endswith(".0"):
-                folio = folio[:-2]
-            rut = normalizar_rut(_celda(fila, mapa, "rut"))
-            monto = parsear_monto(_celda(fila, mapa, "monto"))
-            if not folio or not rut or not monto:
-                if folio or rut:
-                    res.errores.append(f"Fila {n}: folio, RUT o monto invalido")
-                continue
-            res.leidos += 1
-            saldo = parsear_monto(_celda(fila, mapa, "saldo"))
-            saldo = monto if saldo is None else saldo
-            tipo = parsear_monto(_celda(fila, mapa, "tipo")) or 33
-            estado_txt = sin_tildes(str(_celda(fila, mapa, "estado") or ""))
-            pagada = saldo <= 0 or any(p in estado_txt for p in ("pagad", "cancelad"))
-            anulada = "anulad" in estado_txt
-
-            razon = str(_celda(fila, mapa, "razon_social") or "").strip() or rut
-            cli = await s.get(Cliente, rut)
-            if cli is None:
-                s.add(Cliente(rut=rut, razon_social=razon[:300], email=_celda(fila, mapa, "email")))
-            elif razon != rut and cli.razon_social != razon:
-                cli.razon_social, cli.actualizado_en = razon[:300], ahora()
-
-            fac = (await s.execute(select(Factura).where(Factura.tipo_dte == tipo, Factura.folio == folio))).scalars().first()
-            estado = "anulada" if anulada else ("pagada" if pagada else "pendiente")
-            if fac is None:
-                s.add(Factura(tipo_dte=tipo, folio=folio, rut=rut, monto_total=monto, saldo=max(saldo, 0),
-                              fecha_emision=parsear_fecha(_celda(fila, mapa, "emision")),
-                              fecha_vencimiento=parsear_fecha(_celda(fila, mapa, "vencimiento")),
-                              estado=estado, origen=origen))
-                res.nuevos += 1
-            elif fac.estado == "pagada" and estado == "pendiente":
-                res.omitidos += 1  # el agente ya la cobro; el archivo esta desactualizado
-            else:
-                fac.monto_total, fac.saldo, fac.estado = monto, max(saldo, 0), estado
-                fac.fecha_vencimiento = parsear_fecha(_celda(fila, mapa, "vencimiento")) or fac.fecha_vencimiento
-                fac.actualizado_en = ahora()
-                res.actualizados += 1
-            await s.flush()
-        await s.commit()
-    return res
-
-
-# ── Contactos ────────────────────────────────────────────────────────────
-
-
-async def agregar_contacto(telefono: str, rut: str, nombre: str | None = None, razon_social: str | None = None) -> bool:
-    tel, rut_ok = normalizar_telefono(telefono), normalizar_rut(rut)
-    if not tel or not rut_ok:
-        raise ValueError("Telefono o RUT invalido")
-    async with async_session() as s:
-        if await s.get(Cliente, rut_ok) is None:
-            s.add(Cliente(rut=rut_ok, razon_social=(razon_social or rut_ok)[:300]))
-            await s.flush()
-        existe = (await s.execute(select(Contacto).where(Contacto.telefono == tel, Contacto.rut == rut_ok))).scalars().first()
-        if existe:
-            return False
-        s.add(Contacto(telefono=tel, rut=rut_ok, nombre=nombre))
-        await s.commit()
-        return True
-
-
-async def importar_contactos(contenido: bytes, nombre: str) -> ResultadoImportacion:
-    res = ResultadoImportacion()
-    filas = _filas(contenido, nombre)
-    try:
-        inicio, mapa = _buscar_cabecera(filas, COL_CONTACTOS, {"telefono", "rut"})
-    except ValueError as e:
-        res.errores.append(str(e))
-        return res
-    for n, fila in enumerate(filas[inicio + 1:], start=inicio + 2):
-        tel, rut = _celda(fila, mapa, "telefono"), _celda(fila, mapa, "rut")
-        if not tel and not rut:
-            continue
-        res.leidos += 1
-        try:
-            if await agregar_contacto(str(tel), str(rut), _celda(fila, mapa, "nombre"), _celda(fila, mapa, "razon_social")):
-                res.nuevos += 1
-            else:
-                res.omitidos += 1
-        except ValueError:
-            res.errores.append(f"Fila {n}: telefono o RUT invalido")
     return res

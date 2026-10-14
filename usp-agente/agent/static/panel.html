@@ -81,8 +81,7 @@
   <nav id="tabs">
     <button data-t="casos" class="activo">Casos abiertos</button>
     <button data-t="cartola">Cargar cartola BCI</button>
-    <button data-t="facturas">Cargar facturas</button>
-    <button data-t="contactos">Contactos</button>
+    <button data-t="clientes">Clientes y teléfonos</button>
     <button data-t="avisar">Confirmados sin avisar</button>
     <button data-t="comprobantes">Comprobantes</button>
   </nav>
@@ -99,25 +98,11 @@
     <pre class="res" id="rCartola" hidden></pre>
   </section>
 
-  <section id="t-facturas">
-    <h2>Facturas pendientes</h2>
-    <p class="ayuda">Exporta desde Facto las facturas emitidas (Excel o CSV) con folio, RUT, razón social, total y, si existe, saldo y vencimiento. Las facturas que el agente ya marcó como pagadas no se vuelven a abrir.</p>
-    <div class="fila-form"><input type="file" id="fFacturas" accept=".csv,.xlsx,.txt"><button class="b" id="bFacturas">Subir facturas</button></div>
-    <pre class="res" id="rFacturas" hidden></pre>
-  </section>
-
-  <section id="t-contactos">
-    <h2>Teléfonos autorizados por cliente</h2>
-    <p class="ayuda">Solo un teléfono registrado puede consultar las facturas de esa empresa por WhatsApp. Archivo con columnas: teléfono, RUT y, opcional, nombre y razón social.</p>
-    <div class="fila-form"><input type="file" id="fContactos" accept=".csv,.xlsx,.txt"><button class="b" id="bContactos">Subir contactos</button></div>
-    <div class="fila-form">
-      <input id="cTel" placeholder="+56 9 1234 5678">
-      <input id="cRut" placeholder="RUT empresa 76.123.456-7">
-      <input id="cNom" placeholder="Nombre contacto (opcional)">
-      <input id="cRaz" placeholder="Razón social (si es nueva)">
-      <button class="b" id="bContacto">Agregar</button>
-    </div>
-    <pre class="res" id="rContactos" hidden></pre>
+  <section id="t-clientes">
+    <h2>Teléfonos que reconoce el agente</h2>
+    <p class="ayuda">Se leen de la ficha de cada cliente en app.huno.cl (campo teléfonos). Para agregar o corregir un número, edítalo en app.huno.cl: el agente lo toma en menos de 2 minutos. Un número que no aparezca aquí no puede ver facturas por WhatsApp.</p>
+    <div class="fila-form"><input id="buscarCli" placeholder="Buscar por nombre, RUT o teléfono" style="flex:1;min-width:200px"></div>
+    <div id="listaCli"></div>
   </section>
 
   <section id="t-avisar">
@@ -197,7 +182,8 @@
       ['pendientes_banco', 'Esperando banco'],
       ['esperando_rut', 'Esperando RUT'],
       ['confirmados_sin_avisar', 'Confirmados sin avisar', r.confirmados_sin_avisar > 0],
-      ['facturas_pendientes', 'Facturas pendientes'],
+      ['facturas_pendientes', 'Facturas pendientes (Finanzas)'],
+      ['clientes_con_telefono', 'Clientes con teléfono'],
     ];
     $('tiles').replaceChildren(...tiles.map(([k, l, rojo]) => el('div', {class: 'tile' + (rojo ? ' rojo' : '')}, el('div', {class: 'n'}, r[k]), el('div', {class: 'l'}, l))),
       el('div', {class: 'tile'}, el('div', {class: 'n', style: 'font-size:16px'}, r.ultimo_movimiento || '—'), el('div', {class: 'l'}, 'Último movimiento cargado')));
@@ -293,18 +279,28 @@
   $('inToken').addEventListener('keydown', e => { if (e.key === 'Enter') entrar(); });
   $('salir').onclick = salir;
   $('bCartola').onclick = () => subir('fCartola', '/admin/api/cartola', 'rCartola');
-  $('bFacturas').onclick = () => subir('fFacturas', '/admin/api/facturas', 'rFacturas');
-  $('bContactos').onclick = () => subir('fContactos', '/admin/api/contactos/archivo', 'rContactos');
-  $('bContacto').onclick = async () => {
-    $('rContactos').hidden = false;
-    try { $('rContactos').textContent = JSON.stringify(await post('/admin/api/contactos', {telefono: $('cTel').value, rut: $('cRut').value, nombre: $('cNom').value || null, razon_social: $('cRaz').value || null}), null, 2); }
-    catch (e) { $('rContactos').textContent = 'Error: ' + e.message; }
-  };
+  let clientesCache = [];
+  function pintarClientes() {
+    const q = ($('buscarCli').value || '').toLowerCase().replace(/[.\s+-]/g, '');
+    const lista = clientesCache.filter(c => !q || [c.nombre, c.rut || '', ...c.telefonos.map(t => t.telefono + (t.nombre || ''))]
+      .join(' ').toLowerCase().replace(/[.\s+-]/g, '').includes(q));
+    const sinTel = clientesCache.filter(c => !c.telefonos.length).length;
+    $('listaCli').replaceChildren(
+      el('p', {class: 'ayuda'}, `${clientesCache.length} clientes · ${clientesCache.length - sinTel} con teléfono · ${sinTel} sin teléfono reconocido`),
+      el('div', {class: 'tabla'}, el('table', {},
+        el('thead', {}, el('tr', {}, ['Cliente', 'RUT', 'Teléfonos reconocidos'].map(t => el('th', {}, t)))),
+        el('tbody', {}, lista.slice(0, 300).map(c => el('tr', {},
+          el('td', {}, c.nombre), el('td', {}, c.rut || '—'),
+          el('td', {}, c.telefonos.length ? c.telefonos.map(t => el('div', {}, '+' + t.telefono, t.nombre ? ' · ' + t.nombre : '')) : el('span', {class: 'etq gris'}, 'Sin teléfono'))))))));
+  }
+  async function cargarClientes() { clientesCache = await api('/admin/api/clientes'); pintarClientes(); }
+  $('buscarCli').addEventListener('input', pintarClientes);
   $('bFiltrar').onclick = () => cargarComprobantes($('listaComp'), $('filtroEstado').value ? '?estado=' + encodeURIComponent($('filtroEstado').value) : '');
   document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
     document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('activo', x === b));
     document.querySelectorAll('main section').forEach(s => s.classList.toggle('activo', s.id === 't-' + b.dataset.t));
     if (b.dataset.t === 'casos') cargarCasos();
+    if (b.dataset.t === 'clientes') cargarClientes().catch(e => toast(e.message));
     if (b.dataset.t === 'avisar') cargarComprobantes($('listaAvisar'), '?sin_avisar=true');
     if (b.dataset.t === 'comprobantes') cargarComprobantes($('listaComp'), '');
   });

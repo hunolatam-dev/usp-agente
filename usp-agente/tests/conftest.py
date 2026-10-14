@@ -16,7 +16,8 @@ import pytest  # noqa: E402
 from sqlalchemy import delete  # noqa: E402
 
 from agent import config  # noqa: E402
-from agent.db import Base, async_session, inicializar_db  # noqa: E402
+from agent import huno  # noqa: E402
+from agent.db import Base, BaseHuno, async_session, engine, inicializar_db  # noqa: E402
 from agent.providers.base import Adjunto, ProveedorWhatsApp  # noqa: E402
 
 # Datos de transferencia de prueba: cuenta de HUNO terminada en 4321
@@ -50,10 +51,14 @@ class ProveedorFalso(ProveedorWhatsApp):
 @pytest.fixture
 async def db():
     await inicializar_db()
+    # En produccion clientes/facturas/facturas_abonos ya existen (app.huno.cl); aqui se simulan
+    async with engine.begin() as conn:
+        await conn.run_sync(BaseHuno.metadata.create_all)
     async with async_session() as s:
-        for tabla in reversed(Base.metadata.sorted_tables):
+        for tabla in list(reversed(Base.metadata.sorted_tables)) + list(BaseHuno.metadata.sorted_tables):
             await s.execute(delete(tabla))
         await s.commit()
+    huno.invalidar_cache()
     yield
 
 

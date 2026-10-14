@@ -1,15 +1,15 @@
 # agent/herramientas.py — Herramientas que Claude puede usar en la conversacion
 """
-Ninguna herramienta confirma pagos. Las de lectura solo muestran datos de los RUT
-asociados al telefono que escribe (tabla usp_contactos).
+Ninguna herramienta confirma pagos. Las de lectura solo muestran datos de los clientes
+que tienen registrado el telefono que escribe en su ficha de app.huno.cl.
 """
 
 import json
 
 from sqlalchemy import select
 
-from agent import conciliacion, escalamientos, memoria
-from agent.db import Cliente, Comprobante, Factura, async_session
+from agent import conciliacion, escalamientos, huno, memoria
+from agent.db import Comprobante, async_session
 from agent.utils import formatear_monto, formatear_rut, normalizar_rut
 
 DEFINICIONES = [
@@ -61,32 +61,28 @@ ETIQUETAS = {
 
 
 async def consultar_facturas_pendientes(telefono: str) -> dict:
+    clientes = await huno.clientes_de_telefono(telefono)
+    if not clientes:
+        return {"resultado": "telefono_no_registrado"}
+    empresas = []
     async with async_session() as s:
-        ruts = await conciliacion.ruts_de_telefono(s, telefono)
-        if not ruts:
-            return {"resultado": "telefono_no_registrado"}
-        empresas = []
-        for rut in ruts:
-            cli = await s.get(Cliente, rut)
-            facturas = (
-                await s.execute(
-                    select(Factura).where(Factura.rut == rut, Factura.estado == "pendiente")
-                    .order_by(Factura.fecha_vencimiento, Factura.id)
-                )
-            ).scalars().all()
+        for c in clientes:
+            facturas = await huno.facturas_pendientes(s, [c.id])
             empresas.append({
-                "empresa": cli.razon_social if cli else rut,
-                "rut": formatear_rut(rut),
+                "empresa": c.nombre,
+                "rut": formatear_rut(c.rut) if c.rut else None,
                 "total_pendiente": formatear_monto(sum(f.saldo for f in facturas)),
                 "facturas": [
                     {"folio": f.folio, "saldo": formatear_monto(f.saldo),
-                     "emision": f.fecha_emision.isoformat() if f.fecha_emision else None,
-                     "vencimiento": f.fecha_vencimiento.isoformat() if f.fecha_vencimiento else None}
+                     "total_factura": formatear_monto(f.monto),
+                     "abonado": formatear_monto(f.abonado) if f.abonado else None,
+                     "periodo": f.periodo, "glosa": f.glosa,
+                     "emision": f.fecha_emision.isoformat() if f.fecha_emision else None}
                     for f in facturas[:15]
                 ],
             })
-        return {"resultado": "ok", "empresas": empresas,
-                "nota": "Datos segun la ultima carga. Pagos de hoy pueden no estar reflejados."}
+    return {"resultado": "ok", "empresas": empresas,
+            "nota": "Datos de Finanzas de HUNO. Pagos de hoy pueden no estar reflejados todavia."}
 
 
 async def estado_comprobantes(telefono: str) -> dict:
@@ -103,8 +99,7 @@ async def estado_comprobantes(telefono: str) -> dict:
                     "monto": formatear_monto(c.monto) if c.monto else None,
                     "estado": ETIQUETAS.get(c.estado, c.estado)}
             if c.estado == "confirmado" and c.factura_id:
-                fac = await s.get(Factura, c.factura_id)
-                item["factura"] = fac.folio if fac else None
+                item["factura"] = huno.folio_de(await huno.factura(s, c.factura_id))
             salida.append(item)
     return {"comprobantes": salida} if salida else {"comprobantes": [], "nota": "No hay comprobantes recibidos desde este telefono"}
 

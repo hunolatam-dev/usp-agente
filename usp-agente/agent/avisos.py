@@ -16,13 +16,13 @@ async def avisar_confirmaciones(proveedor: ProveedorWhatsApp | None, resultados)
     """
     enviados, sin_ventana = 0, 0
     for comp, res in resultados:
-        if res.estado != "confirmado":
+        if res.estado not in ("confirmado", "abono"):
             continue
         conv = await memoria.obtener_conversacion(comp.telefono)
         ok = False
         if proveedor and memoria.dentro_de_ventana(conv):
             ok = await proveedor.enviar_mensaje(
-                comp.telefono, res.mensaje(), memoria.contexto_de(conv, idempotencia=f"confirmacion-{comp.id}")
+                comp.telefono, res.mensaje(), memoria.contexto_de(conv, idempotencia=f"confirmacion-{comp.id}-{res.folio}-{res.monto}")
             )
         if ok:
             enviados += 1

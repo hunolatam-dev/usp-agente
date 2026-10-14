@@ -1,0 +1,235 @@
+# agent/huno.py — Clientes y facturas de app.huno.cl (misma base Supabase)
+"""
+El agente NO tiene su propia lista de clientes ni de facturas: lee las de app.huno.cl.
+
+- Telefono -> cliente: columna clientes.telefonos (uno o varios numeros, cada uno con el
+  nombre de su dueno). El formato de ese texto lo define app.huno.cl, asi que aqui se
+  extraen los numeros de forma tolerante (JSON o texto libre).
+- Saldo de una factura = facturas.monto - suma(facturas_abonos.monto), si no esta pagada.
+- Al confirmar un pago: pago total -> facturas.pagado = true; pago parcial (solo desde el
+  panel) -> nueva fila en facturas_abonos.
+"""
+
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import date
+
+from sqlalchemy import func, or_, select, update
+
+from agent.db import AbonoHuno, ClienteHuno, FacturaHuno, ahora, async_session
+from agent.utils import normalizar_rut, normalizar_telefono
+
+logger = logging.getLogger("usp")
+
+USUARIO_AGENTE = "Agente WhatsApp USP"
+_TTL = 120  # segundos que se guarda en memoria la lista de clientes
+
+_RE_NUMERO = re.compile(r"\+?\d[\d\s().-]{6,18}\d")
+
+
+@dataclass
+class Cliente:
+    id: int
+    rut: str | None              # normalizado: 76123456-7
+    nombre: str                  # razon social o nombre visible
+    telefonos: list[tuple[str, str | None]] = field(default_factory=list)  # (56912345678, "Maria")
+
+    def nombre_de(self, telefono: str) -> str | None:
+        return next((n for t, n in self.telefonos if t == telefono), None)
+
+
+def _telefono_valido(digitos: str | None) -> str | None:
+    tel = normalizar_telefono(digitos)
+    # Chile: 56 + 9 digitos. Otros paises: se aceptan entre 10 y 15 digitos.
+    if tel and (len(tel) == 11 and tel.startswith("56") or (not tel.startswith("56") and 10 <= len(tel) <= 15)):
+        return tel
+    return None
+
+
+def _limpiar_nombre(texto: str) -> str | None:
+    t = re.sub(r"[\d+()\-:|/,;]+", " ", texto or "")
+    t = re.sub(r"\b(tel[eé]fono|telefono|fono|cel(ular)?|whatsapp|wsp|m[oó]vil|n[uú]mero)\b", " ", t, flags=re.I)
+    t = " ".join(t.split()).strip(" .")
+    return t[:80] or None
+
+
+def parsear_telefonos(texto: str | None) -> list[tuple[str, str | None]]:
+    """Extrae (telefono, nombre del dueno) de clientes.telefonos, sea JSON o texto libre."""
+    if not texto or not str(texto).strip():
+        return []
+    salida: list[tuple[str, str | None]] = []
+
+    def agregar(numero, nombre):
+        tel = _telefono_valido(re.sub(r"\D", "", str(numero or "")))
+        if tel and tel not in [t for t, _ in salida]:
+            salida.append((tel, (str(nombre).strip()[:80] or None) if nombre else None))
+
+    try:
+        datos = json.loads(texto)
+    except (ValueError, TypeError):
+        datos = None
+
+    if isinstance(datos, (list, dict)):
+        elementos = datos if isinstance(datos, list) else [datos]
+        for e in elementos:
+            if isinstance(e, dict):
+                numero = next((e[k] for k in e if re.search(r"tel|fono|num|cel|whats|phone|movil", k, re.I) and e[k]), None)
+                nombre = next((e[k] for k in e if re.search(r"nombre|name|due|contacto|persona|quien", k, re.I) and e[k]), None)
+                if numero:
+                    agregar(numero, nombre)
+            elif isinstance(e, (str, int)):
+                for m in _RE_NUMERO.finditer(str(e)):
+                    agregar(m.group(0), _limpiar_nombre(str(e).replace(m.group(0), " ")))
+        if salida:
+            return salida
+
+    # Texto libre: se separa por renglones / ; / , y en cada trozo el resto del texto es el nombre
+    for trozo in re.split(r"[\n;|]+|,(?!\d)", str(texto)):
+        for m in _RE_NUMERO.finditer(trozo):
+            agregar(m.group(0), _limpiar_nombre(trozo.replace(m.group(0), " ")))
+    return salida
+
+
+# ── Cache de clientes ────────────────────────────────────────────────────
+
+_cache: dict = {"t": 0.0, "clientes": []}
+
+
+def invalidar_cache():
+    _cache["t"] = 0.0
+
+
+async def clientes(forzar: bool = False) -> list[Cliente]:
+    if not forzar and time.monotonic() - _cache["t"] < _TTL and _cache["clientes"]:
+        return _cache["clientes"]
+    async with async_session() as s:
+        filas = (await s.execute(select(ClienteHuno))).scalars().all()
+    lista = [
+        Cliente(
+            id=f.id,
+            rut=normalizar_rut(f.rut),
+            nombre=(f.nombre_empresa or f.nombre or f.rut or f"Cliente {f.id}").strip(),
+            telefonos=parsear_telefonos(f.telefonos),
+        )
+        for f in filas
+    ]
+    _cache.update(t=time.monotonic(), clientes=lista)
+    return lista
+
+
+async def clientes_de_telefono(telefono: str) -> list[Cliente]:
+    return [c for c in await clientes() if any(t == telefono for t, _ in c.telefonos)]
+
+
+async def clientes_de_rut(rut: str | None) -> list[Cliente]:
+    if not rut:
+        return []
+    return [c for c in await clientes() if c.rut == rut]
+
+
+async def cliente_por_id(cid: int) -> Cliente | None:
+    return next((c for c in await clientes() if c.id == cid), None)
+
+
+# ── Facturas ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class FacturaPendiente:
+    id: int
+    cliente_id: int
+    folio: str
+    monto: int
+    abonado: int
+    saldo: int
+    fecha_emision: date | None
+    anio: int | None
+    mes: int | None
+    glosa: str | None
+
+    @property
+    def periodo(self) -> str | None:
+        return f"{self.mes:02d}/{self.anio}" if self.mes and self.anio else None
+
+
+def _folio(f: FacturaHuno) -> str:
+    return (f.folio_sii or f.folio or str(f.id)).strip()
+
+
+async def facturas_pendientes(s, cliente_ids: list[int]) -> list[FacturaPendiente]:
+    if not cliente_ids:
+        return []
+    abonos = (
+        select(AbonoHuno.factura_id, func.coalesce(func.sum(AbonoHuno.monto), 0).label("abonado"))
+        .group_by(AbonoHuno.factura_id)
+        .subquery()
+    )
+    filas = (
+        await s.execute(
+            select(FacturaHuno, func.coalesce(abonos.c.abonado, 0))
+            .outerjoin(abonos, abonos.c.factura_id == FacturaHuno.id)
+            .where(FacturaHuno.cliente_id.in_(cliente_ids),
+                   or_(FacturaHuno.pagado.is_(None), FacturaHuno.pagado.is_(False)))
+            .order_by(FacturaHuno.fecha_emision.is_(None), FacturaHuno.fecha_emision,
+                      FacturaHuno.anio, FacturaHuno.mes, FacturaHuno.id)
+        )
+    ).all()
+    salida = []
+    for f, abonado in filas:
+        monto = int(f.monto or 0)
+        saldo = monto - int(abonado or 0)
+        if saldo <= 0:
+            continue
+        salida.append(FacturaPendiente(f.id, f.cliente_id, _folio(f), monto, int(abonado or 0), saldo,
+                                       f.fecha_emision, f.anio, f.mes, f.glosa))
+    return salida
+
+
+async def saldo_bloqueado(s, factura_id: int) -> tuple[FacturaHuno | None, int]:
+    """Lee la factura bloqueando la fila (Postgres) y devuelve (factura, saldo)."""
+    f = (
+        await s.execute(select(FacturaHuno).where(FacturaHuno.id == factura_id).with_for_update())
+    ).scalars().first()
+    if f is None:
+        return None, 0
+    abonado = (
+        await s.execute(select(func.coalesce(func.sum(AbonoHuno.monto), 0)).where(AbonoHuno.factura_id == factura_id))
+    ).scalar_one()
+    return f, int(f.monto or 0) - int(abonado or 0)
+
+
+async def aplicar_pago(s, factura_id: int, monto: int, fecha_pago: date, usuario: str) -> tuple[bool, int]:
+    """
+    Registra el pago en app.huno.cl dentro de la transaccion `s` (no hace commit).
+    - Si cubre el saldo completo: pagado = true.
+    - Si es menor: agrega un abono (y si con eso llega a 0, tambien pagado = true).
+    Devuelve (ok, saldo_restante). ok=False si la factura ya esta pagada o el monto excede el saldo.
+    """
+    f, saldo = await saldo_bloqueado(s, factura_id)
+    if f is None or f.pagado or monto <= 0 or monto > saldo:
+        return False, max(saldo, 0)
+    if monto < saldo:
+        s.add(AbonoHuno(factura_id=factura_id, monto=monto))
+        await s.execute(
+            update(FacturaHuno).where(FacturaHuno.id == factura_id)
+            .values(usuario_ultima_accion=usuario, fecha_ultima_accion=ahora())
+        )
+        return True, saldo - monto
+    r = await s.execute(
+        update(FacturaHuno)
+        .where(FacturaHuno.id == factura_id, or_(FacturaHuno.pagado.is_(None), FacturaHuno.pagado.is_(False)))
+        .values(pagado=True, fecha_pago=fecha_pago, usuario_pago=usuario,
+                usuario_ultima_accion=usuario, fecha_ultima_accion=ahora())
+    )
+    return r.rowcount == 1, 0
+
+
+async def factura(s, factura_id: int) -> FacturaHuno | None:
+    return await s.get(FacturaHuno, factura_id)
+
+
+def folio_de(f: FacturaHuno | None) -> str | None:
+    return _folio(f) if f is not None else None

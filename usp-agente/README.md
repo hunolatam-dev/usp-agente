@@ -9,7 +9,7 @@ Basado en [WhatsApp AgentKit](https://github.com/Hainrixz/whatsapp-agentkit) (MI
 | El cliente… | El agente… |
 |---|---|
 | Saluda o agradece | Responde con un texto fijo, sin llamar a la IA |
-| Pregunta cuánto debe | Muestra sus facturas, pero solo si el teléfono está registrado como contacto de esa empresa |
+| Pregunta cuánto debe | Muestra sus facturas de Finanzas (app.huno.cl), pero solo si su teléfono está en la ficha del cliente en app.huno.cl |
 | Envía un comprobante (imagen o PDF) | La IA lee monto, fecha, N° de operación y cuenta de destino. **El código** decide si el pago se confirma |
 | Escribe desde el celular de USP (ejecutivo) | El agente se calla 12 h en ese chat |
 
@@ -17,11 +17,13 @@ Basado en [WhatsApp AgentKit](https://github.com/Hainrixz/whatsapp-agentkit) (MI
 1. El comprobante es legible y no se usó antes (ni el mismo archivo ni el mismo N° de operación).
 2. El monto es ≤ $3.000.000 (configurable).
 3. La cuenta de destino es de HUNO.
-4. Se sabe qué empresa paga: por el teléfono registrado, por el RUT que escribe el cliente o por el RUT de origen.
-5. Hay una factura pendiente de esa empresa por **el monto exacto**. Si hay varias, se paga la más antigua.
+4. Se sabe qué cliente paga: por el teléfono de su ficha en app.huno.cl, por el RUT que escribe el cliente o por el RUT de origen.
+5. Hay una factura pendiente de ese cliente en Finanzas de app.huno.cl por **el saldo exacto** (monto menos abonos). Si hay varias, se paga la más antigua.
 6. Hay **una** transferencia en la cartola por ese monto, en las fechas del comprobante y sin usar.
 
 Si solo falta que aparezca en el banco, el comprobante queda "esperando banco" y se confirma solo al cargar la cartola, con aviso por WhatsApp. Todo lo demás (pagos parciales, de varias facturas, montos que no calzan, cuenta distinta, comprobante repetido) va al panel como **caso**.
+
+Al confirmar, la factura queda **pagada en Finanzas de app.huno.cl** (`facturas.pagado`, con fecha de pago y usuario "Agente WhatsApp USP"). Un pago parcial confirmado a mano desde el panel queda como **abono** (`facturas_abonos`).
 
 La base de datos impide usar la misma transferencia dos veces, incluso si llegan dos comprobantes al mismo tiempo desde chats distintos.
 
@@ -52,12 +54,10 @@ Prueba con "Send test": debe responder 200. Los eventos de prueba no se contesta
 ### 5. Completar datos y cargar información
 - En `config/business.yaml`, reemplaza todo lo que dice **COMPLETAR**: titular, RUT, número de cuenta, correo y `cuentas_destino`.
 - En `knowledge/faq_usp.md`, revisa las respuestas frecuentes. El agente no inventa nada que no esté ahí.
-- Entra al panel en `https://TU-APP.up.railway.app/admin` con el `ADMIN_TOKEN` y carga:
-  1. **Facturas** (export de Facto): folio, RUT, razón social, total, saldo y vencimiento.
-  2. **Contactos**: teléfono y RUT de cada cliente.
-  3. **Cartola BCI Pyme** (Excel o CSV), idealmente cada mañana y cada tarde.
+- Los **clientes, teléfonos y facturas se leen directo de app.huno.cl**: no hay que cargarlos. Para que el agente reconozca un número, debe estar en el campo *teléfonos* de la ficha del cliente.
+- Entra al panel en `https://TU-APP.up.railway.app/admin` con el `ADMIN_TOKEN` y carga la **Cartola BCI Pyme** (Excel o CSV), idealmente cada mañana y cada tarde. En la pestaña *Clientes y teléfonos* puedes revisar qué números reconoce.
 
-En `ejemplos/` hay archivos de muestra con el formato que reconoce.
+En `ejemplos/` hay una cartola de muestra con el formato que reconoce.
 
 ## Uso diario del panel `/admin`
 - **Casos abiertos:** ver el comprobante, confirmar a mano (eligiendo factura y movimiento; un pago de varias facturas se registra una por una), pausar o reactivar el agente en ese chat, y cerrar el caso.
@@ -74,12 +74,12 @@ Para recibir los casos nuevos en Telegram, configura `TELEGRAM_BOT_TOKEN` y `TEL
 ## Desarrollo
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest            # 38 pruebas (SQLite)
+python -m pytest            # 42 pruebas (SQLite)
 TEST_DATABASE_URL=postgresql://... python -m pytest   # contra Postgres
 uvicorn agent.main:app --reload --port 8000
 ```
 
 ## Próximas fases (pendientes)
 - **Banco automático:** reemplazar la carga manual de la cartola por una fuente automática de BCI. Solo hay que llamar a `importadores` o insertar en `usp_movimientos` con `fuente="api"`.
-- **Finanzas de app.huno.cl en lugar de Facto:** que Finanzas escriba directo en `usp_facturas` (`origen="finanzas"`) y genere el comprobante de pago.
+- **Comprobante de pago:** que Finanzas de app.huno.cl genere y envíe el comprobante (hoy se marca la factura pagada, pero el comprobante PDF lo envía el equipo).
 - **Recordatorios de cobro:** requieren plantillas aprobadas por Meta (Zernio permite enviarlas).

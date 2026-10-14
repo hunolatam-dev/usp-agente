@@ -35,7 +35,10 @@ logger = logging.getLogger("usp")
 
 
 def _normalizar_url(url: str) -> str:
-    """SQLAlchemy asincrono necesita el driver explicito."""
+    """SQLAlchemy asincrono necesita el driver explicito. Tolera errores de pegado comunes."""
+    url = url.strip().strip("'\"").strip()
+    if url.upper().startswith("DATABASE_URL="):
+        url = url.split("=", 1)[1].strip().strip("'\"").strip()
     if url.startswith("postgresql://"):
         return url.replace("postgresql://", "postgresql+asyncpg://", 1)
     if url.startswith("postgres://"):
@@ -126,51 +129,52 @@ class Conversacion(Base):
     rut_declarado: Mapped[str | None] = mapped_column(String(12))
 
 
-# ── Clientes y facturas ──────────────────────────────────────────────────
+# ── Datos de app.huno.cl (tablas que YA existen en Supabase) ─────────────
+# Solo se declaran las columnas que usa el agente. Viven en otra "metadata" para que
+# create_all() NUNCA intente crearlas ni tocarlas en produccion; las pruebas las crean aparte.
 
 
-class Cliente(Base):
-    __tablename__ = "usp_clientes"
-
-    rut: Mapped[str] = mapped_column(String(12), primary_key=True)  # 76123456-7
-    razon_social: Mapped[str] = mapped_column(String(300))
-    email: Mapped[str | None] = mapped_column(String(200))
-    actualizado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
+class BaseHuno(DeclarativeBase):
+    pass
 
 
-class Contacto(Base):
-    """
-    Telefonos autorizados de cada cliente. Solo un telefono registrado aqui puede ver
-    las facturas pendientes de ese RUT. Un telefono puede estar en varios RUT
-    (ej: dueno de varias empresas).
-    """
+class ClienteHuno(BaseHuno):
+    __tablename__ = "clientes"
 
-    __tablename__ = "usp_contactos"
-    __table_args__ = (UniqueConstraint("telefono", "rut", name="uq_usp_contacto"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telefono: Mapped[str] = mapped_column(String(50), index=True)
-    rut: Mapped[str] = mapped_column(String(12), ForeignKey("usp_clientes.rut"), index=True)
-    nombre: Mapped[str | None] = mapped_column(String(200))
-    creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rut: Mapped[str | None] = mapped_column(Text)
+    nombre: Mapped[str | None] = mapped_column(Text)
+    nombre_empresa: Mapped[str | None] = mapped_column(Text)
+    telefonos: Mapped[str | None] = mapped_column(Text)
+    correos: Mapped[str | None] = mapped_column(Text)
+    activo: Mapped[bool | None] = mapped_column(Boolean)
 
 
-class Factura(Base):
-    __tablename__ = "usp_facturas"
-    __table_args__ = (UniqueConstraint("tipo_dte", "folio", name="uq_usp_factura"),)
+class FacturaHuno(BaseHuno):
+    __tablename__ = "facturas"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tipo_dte: Mapped[int] = mapped_column(Integer, default=33)  # 33 factura, 34 exenta
-    folio: Mapped[str] = mapped_column(String(30))
-    rut: Mapped[str] = mapped_column(String(12), ForeignKey("usp_clientes.rut"), index=True)
-    monto_total: Mapped[int] = mapped_column(BigInteger)
-    saldo: Mapped[int] = mapped_column(BigInteger)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cliente_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    folio: Mapped[str | None] = mapped_column(Text)
+    folio_sii: Mapped[str | None] = mapped_column(Text)
+    monto: Mapped[int | None] = mapped_column(Integer)
+    anio: Mapped[int | None] = mapped_column(Integer)
+    mes: Mapped[int | None] = mapped_column(Integer)
+    pagado: Mapped[bool | None] = mapped_column(Boolean)
+    fecha_pago: Mapped[date | None] = mapped_column(Date)
+    usuario_pago: Mapped[str | None] = mapped_column(Text)
     fecha_emision: Mapped[date | None] = mapped_column(Date)
-    fecha_vencimiento: Mapped[date | None] = mapped_column(Date)
-    estado: Mapped[str] = mapped_column(String(20), default="pendiente", index=True)
-    # pendiente | pagada | anulada
-    origen: Mapped[str] = mapped_column(String(30), default="facto")  # facto | finanzas
-    actualizado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
+    glosa: Mapped[str | None] = mapped_column(Text)
+    usuario_ultima_accion: Mapped[str | None] = mapped_column(Text)
+    fecha_ultima_accion: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AbonoHuno(BaseHuno):
+    __tablename__ = "facturas_abonos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    factura_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    monto: Mapped[int | None] = mapped_column(Integer)
 
 
 # ── Banco ────────────────────────────────────────────────────────────────
@@ -226,7 +230,7 @@ class Comprobante(Base):
     estado: Mapped[str] = mapped_column(String(30), default="recibido", index=True)
     # recibido | confirmado | pendiente_banco | esperando_rut | escalado | no_legible
     motivo: Mapped[str | None] = mapped_column(Text)
-    factura_id: Mapped[int | None] = mapped_column(ForeignKey("usp_facturas.id"))
+    factura_id: Mapped[int | None] = mapped_column(Integer)  # facturas.id de app.huno.cl
     movimiento_id: Mapped[int | None] = mapped_column(ForeignKey("usp_movimientos.id"))
     # Si se confirmo despues (al cargar la cartola) y no se pudo avisar por WhatsApp
     notificado: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -245,7 +249,7 @@ class Pago(Base):
     __table_args__ = (UniqueConstraint("movimiento_id", "factura_id", name="uq_usp_pago"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    factura_id: Mapped[int] = mapped_column(ForeignKey("usp_facturas.id"), index=True)
+    factura_id: Mapped[int] = mapped_column(Integer, index=True)  # facturas.id de app.huno.cl
     movimiento_id: Mapped[int] = mapped_column(ForeignKey("usp_movimientos.id"), index=True)
     comprobante_id: Mapped[int | None] = mapped_column(ForeignKey("usp_comprobantes.id"))
     monto: Mapped[int] = mapped_column(BigInteger)

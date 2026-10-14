@@ -1,22 +1,21 @@
 -- Esquema del agente USP (WhatsApp de cobranzas HUNO®) para Supabase
--- Ejecutar UNA vez en Supabase -> SQL Editor. Es idempotente (se puede repetir).
--- Las tablas usan prefijo usp_ para no chocar con las de app.huno.cl.
+-- Ejecutar en Supabase -> SQL Editor. Es idempotente: se puede ejecutar las veces que quieras.
 --
--- Seguridad: RLS activado SIN politicas. Asi, la anon key que usan las paginas web
--- (app.huno.cl, huno.cl) NO puede leer ni escribir estas tablas. El agente se conecta
--- directo a Postgres con la cadena de conexion (rol postgres), que no pasa por RLS.
+-- El agente usa las tablas de app.huno.cl (clientes, facturas, facturas_abonos) SIN
+-- modificar su estructura: solo lee clientes/facturas y, al confirmar un pago, marca
+-- facturas.pagado o agrega una fila en facturas_abonos.
+--
+-- Seguridad: RLS activado SIN politicas en las tablas usp_*. La anon key de las webs
+-- (app.huno.cl, huno.cl) no puede leerlas. El agente se conecta con la cadena de conexion
+-- (rol postgres), que no pasa por RLS.
 
 begin;
 
-CREATE TABLE IF NOT EXISTS usp_clientes (
-	rut VARCHAR(12) NOT NULL, 
-	razon_social VARCHAR(300) NOT NULL, 
-	email VARCHAR(200), 
-	actualizado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
-	PRIMARY KEY (rut)
-);
-
-ALTER TABLE usp_clientes ENABLE ROW LEVEL SECURITY;
+-- Version anterior: el agente tenia su propia lista de clientes, contactos y facturas.
+-- Ya no se usan (ahora se leen de app.huno.cl). Estaban vacias.
+drop table if exists usp_contactos cascade;
+drop table if exists usp_facturas cascade;
+drop table if exists usp_clientes cascade;
 
 CREATE TABLE IF NOT EXISTS usp_conversaciones (
 	telefono VARCHAR(50) NOT NULL, 
@@ -72,42 +71,6 @@ CREATE INDEX IF NOT EXISTS ix_usp_movimientos_fecha ON usp_movimientos (fecha);
 CREATE INDEX IF NOT EXISTS ix_usp_movimientos_monto ON usp_movimientos (monto);
 ALTER TABLE usp_movimientos ENABLE ROW LEVEL SECURITY;
 
-CREATE TABLE IF NOT EXISTS usp_contactos (
-	id SERIAL NOT NULL, 
-	telefono VARCHAR(50) NOT NULL, 
-	rut VARCHAR(12) NOT NULL, 
-	nombre VARCHAR(200), 
-	creado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
-	PRIMARY KEY (id), 
-	CONSTRAINT uq_usp_contacto UNIQUE (telefono, rut), 
-	FOREIGN KEY(rut) REFERENCES usp_clientes (rut)
-);
-
-CREATE INDEX IF NOT EXISTS ix_usp_contactos_rut ON usp_contactos (rut);
-CREATE INDEX IF NOT EXISTS ix_usp_contactos_telefono ON usp_contactos (telefono);
-ALTER TABLE usp_contactos ENABLE ROW LEVEL SECURITY;
-
-CREATE TABLE IF NOT EXISTS usp_facturas (
-	id SERIAL NOT NULL, 
-	tipo_dte INTEGER NOT NULL, 
-	folio VARCHAR(30) NOT NULL, 
-	rut VARCHAR(12) NOT NULL, 
-	monto_total BIGINT NOT NULL, 
-	saldo BIGINT NOT NULL, 
-	fecha_emision DATE, 
-	fecha_vencimiento DATE, 
-	estado VARCHAR(20) NOT NULL, 
-	origen VARCHAR(30) NOT NULL, 
-	actualizado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
-	PRIMARY KEY (id), 
-	CONSTRAINT uq_usp_factura UNIQUE (tipo_dte, folio), 
-	FOREIGN KEY(rut) REFERENCES usp_clientes (rut)
-);
-
-CREATE INDEX IF NOT EXISTS ix_usp_facturas_estado ON usp_facturas (estado);
-CREATE INDEX IF NOT EXISTS ix_usp_facturas_rut ON usp_facturas (rut);
-ALTER TABLE usp_facturas ENABLE ROW LEVEL SECURITY;
-
 CREATE TABLE IF NOT EXISTS usp_comprobantes (
 	id SERIAL NOT NULL, 
 	telefono VARCHAR(50) NOT NULL, 
@@ -135,7 +98,6 @@ CREATE TABLE IF NOT EXISTS usp_comprobantes (
 	creado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
 	actualizado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
 	PRIMARY KEY (id), 
-	FOREIGN KEY(factura_id) REFERENCES usp_facturas (id), 
 	FOREIGN KEY(movimiento_id) REFERENCES usp_movimientos (id)
 );
 
@@ -176,7 +138,6 @@ CREATE TABLE IF NOT EXISTS usp_pagos (
 	creado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
 	PRIMARY KEY (id), 
 	CONSTRAINT uq_usp_pago UNIQUE (movimiento_id, factura_id), 
-	FOREIGN KEY(factura_id) REFERENCES usp_facturas (id), 
 	FOREIGN KEY(movimiento_id) REFERENCES usp_movimientos (id), 
 	FOREIGN KEY(comprobante_id) REFERENCES usp_comprobantes (id)
 );
@@ -185,7 +146,9 @@ CREATE INDEX IF NOT EXISTS ix_usp_pagos_factura_id ON usp_pagos (factura_id);
 CREATE INDEX IF NOT EXISTS ix_usp_pagos_movimiento_id ON usp_pagos (movimiento_id);
 ALTER TABLE usp_pagos ENABLE ROW LEVEL SECURITY;
 
--- Revocar acceso de la API REST de Supabase (anon / authenticated) por si acaso
-revoke all on table usp_clientes, usp_conversaciones, usp_eventos_procesados, usp_mensajes, usp_movimientos, usp_contactos, usp_facturas, usp_comprobantes, usp_escalamientos, usp_pagos from anon, authenticated;
+revoke all on table usp_conversaciones, usp_eventos_procesados, usp_mensajes, usp_movimientos, usp_comprobantes, usp_escalamientos, usp_pagos from anon, authenticated;
 
 commit;
+
+-- Comprobacion (solo lectura): todas deben decir rls = true
+-- select tablename, rowsecurity as rls from pg_tables where tablename like 'usp_%' order by 1;

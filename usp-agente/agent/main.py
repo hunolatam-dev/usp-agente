@@ -6,7 +6,7 @@ cobranzas: lee comprobantes, los cruza con la cartola BCI y confirma pagos.
 Rutas:
   GET  /           salud del servicio
   POST /webhook    eventos de Zernio (message.received y message.sent)
-  GET  /admin      panel de USP (cartola, facturas, contactos, casos)
+  GET  /admin      panel de USP (cartola, casos, clientes y teléfonos)
 """
 
 import asyncio

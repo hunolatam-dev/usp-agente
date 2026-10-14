@@ -9,7 +9,7 @@ import re
 
 from sqlalchemy import func, select
 
-from agent import config, herramientas, llm, memoria
+from agent import config, herramientas, huno, llm, memoria
 from agent.db import Comprobante, async_session
 from agent.utils import buscar_ruts, sin_tildes
 
@@ -37,9 +37,19 @@ async def _comprobantes_esperando_rut(telefono: str) -> int:
         )).scalar_one()
 
 
+async def quien_es(telefono: str) -> tuple[str | None, list[str]]:
+    """(nombre del dueno del numero, empresas) segun las fichas de app.huno.cl."""
+    clientes = await huno.clientes_de_telefono(telefono)
+    nombre = next((c.nombre_de(telefono) for c in clientes if c.nombre_de(telefono)), None)
+    return nombre, [c.nombre for c in clientes]
+
+
 async def regla_rapida(telefono: str, texto: str) -> str | None:
     t = _limpio(texto)
     if t in _SALUDOS:
+        nombre, _ = await quien_es(telefono)
+        if nombre and config.respuesta("saludo_conocido"):
+            return config.respuesta("saludo_conocido", nombre=nombre.split()[0].title())
         return config.respuesta("saludo")
     if t in _GRACIAS or texto.strip() in _GRACIAS:
         return config.respuesta("gracias")
@@ -68,6 +78,16 @@ async def responder(telefono: str, texto: str) -> tuple[str, bool]:
     mensajes = historial + [{"role": "user", "content": texto}]
     # El system prompt va con cache: se cobra completo una vez y despues a ~10%
     system = [{"type": "text", "text": config.system_prompt(), "cache_control": {"type": "ephemeral"}}]
+    nombre, empresas = await quien_es(telefono)
+    if empresas:
+        system.append({"type": "text", "text": (
+            "## Quien escribe\nEste numero esta registrado en HUNO"
+            + (f" a nombre de {nombre}" if nombre else "")
+            + f", contacto de: {', '.join(empresas)}. Puedes usar consultar_facturas_pendientes.")})
+    else:
+        system.append({"type": "text", "text": (
+            "## Quien escribe\nEste numero NO esta registrado en ninguna ficha de cliente de HUNO. "
+            "No muestres deudas; si las pide, deriva con motivo registro_contacto.")})
 
     try:
         for _ in range(MAX_VUELTAS):

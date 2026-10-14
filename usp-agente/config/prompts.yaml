@@ -44,6 +44,8 @@ system_prompt: |
 # Respuestas fijas: no gastan tokens
 respuestas:
   saludo: "Hola, le saluda el asistente de USP de HUNO®. Puedo ayudarle con el estado de sus facturas, datos de transferencia o validar un comprobante de pago. ¿En qué le ayudo?"
+  # Si el numero esta en la ficha del cliente en app.huno.cl, se usa este saludo con su nombre
+  saludo_conocido: "Hola {nombre}, le saluda el asistente de USP de HUNO®. Puedo ayudarle con el estado de sus facturas, datos de transferencia o validar un comprobante de pago. ¿En qué le ayudo?"
   gracias: "A usted. Quedo atento si necesita algo más."
   error: "Disculpe, tuve un problema técnico. Un ejecutivo de USP revisará su mensaje."
   audio: "Por ahora no puedo escuchar audios. ¿Me lo puede escribir? Si es un pago, envíe el comprobante como imagen o PDF."
@@ -51,6 +53,7 @@ respuestas:
 
   # Resultados de validar un comprobante. {monto}, {folio}, {razon_social}, {rut} se reemplazan.
   confirmado: "Pago confirmado ✅\nFactura N° {folio} de {razon_social} por {monto} quedó pagada. Muchas gracias."
+  abono: "Registramos su pago de {monto} a la factura N° {folio} de {razon_social}. Saldo pendiente de esa factura: {saldo}. Muchas gracias."
   pendiente_banco: "Recibimos su comprobante por {monto}. Aún no se refleja en nuestra cuenta; le confirmaremos por aquí apenas aparezca (normalmente dentro del día hábil siguiente)."
   esperando_rut: "Recibimos su comprobante por {monto}. Para asociarlo a la factura correcta, ¿me indica el RUT de la empresa que está pagando?"
   escalado: "Recibimos su comprobante por {monto}. Un ejecutivo de USP lo revisará y le responderá en horario hábil ({horario})."

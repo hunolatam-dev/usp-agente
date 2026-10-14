@@ -6,9 +6,10 @@ Toda la decision es deterministica. Un pago se confirma solo si TODO esto se cum
   2. No es un comprobante ya usado (mismo archivo o mismo N° de operacion).
   3. El monto no supera el maximo de confirmacion automatica.
   4. La cuenta de destino (si se lee) es de HUNO.
-  5. Se sabe a que empresa corresponde (telefono registrado, RUT declarado o RUT de origen).
-  6. Hay una factura pendiente de esa empresa con saldo EXACTO igual al monto
-     (si hay varias del mismo monto, se paga la mas antigua).
+  5. Se sabe a que cliente corresponde: telefono registrado en la ficha del cliente en
+     app.huno.cl, RUT escrito en el chat o RUT de origen de la transferencia.
+  6. Hay una factura pendiente (Finanzas de app.huno.cl) de ese cliente con saldo EXACTO
+     igual al monto (si hay varias del mismo monto, se paga la mas antigua).
   7. Hay UNA transferencia en el banco por ese monto, en el rango de fechas, aun no usada.
 
 Si falta solo el banco (paso 7) y el comprobante es reciente, queda "pendiente_banco" y se
@@ -22,13 +23,10 @@ from datetime import timedelta
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from agent import config, escalamientos
+from agent import config, escalamientos, huno
 from agent.db import (
-    Cliente,
     Comprobante,
-    Contacto,
     Conversacion,
-    Factura,
     Movimiento,
     Pago,
     ahora,
@@ -48,9 +46,11 @@ class Resultado:
     folio: str | None = None
     razon_social: str | None = None
     rut: str | None = None
+    saldo: int | None = None  # solo para "abono": lo que queda por pagar
 
     def mensaje(self) -> str:
         campos = {
+            "saldo": formatear_monto(self.saldo) if self.saldo is not None else "",
             "monto": formatear_monto(self.monto) if self.monto else "",
             "folio": self.folio or "",
             "razon_social": self.razon_social or "",
@@ -61,17 +61,15 @@ class Resultado:
         return config.respuesta(self.estado, **campos)
 
 
-async def ruts_de_telefono(s, telefono: str) -> list[str]:
-    return list((await s.execute(select(Contacto.rut).where(Contacto.telefono == telefono))).scalars().all())
-
-
-async def _candidatos_rut(s, comp: Comprobante) -> list[str]:
-    ruts = await ruts_de_telefono(s, comp.telefono)
+async def candidatos(s, comp: Comprobante) -> list[huno.Cliente]:
+    """Clientes posibles: los del telefono, y los del RUT declarado o de origen."""
+    lista = list(await huno.clientes_de_telefono(comp.telefono))
     conv = await s.get(Conversacion, comp.telefono)
-    for extra in (conv.rut_declarado if conv else None, comp.rut_origen):
-        if extra and extra not in ruts and await s.get(Cliente, extra):
-            ruts.append(extra)
-    return ruts
+    for rut in (conv.rut_declarado if conv else None, comp.rut_origen):
+        for c in await huno.clientes_de_rut(rut):
+            if c.id not in [x.id for x in lista]:
+                lista.append(c)
+    return lista
 
 
 def _cuenta_destino_ok(comp: Comprobante) -> bool:
@@ -112,10 +110,10 @@ async def evaluar(comprobante_id: int) -> Resultado:
         if comp is None:
             raise ValueError(f"Comprobante {comprobante_id} no existe")
         if comp.estado == "confirmado":
-            fac = await s.get(Factura, comp.factura_id) if comp.factura_id else None
-            cli = await s.get(Cliente, fac.rut) if fac else None
-            return Resultado("confirmado", "", comp.monto, fac.folio if fac else None,
-                             cli.razon_social if cli else None, fac.rut if fac else None)
+            fac = await huno.factura(s, comp.factura_id) if comp.factura_id else None
+            cli = await huno.cliente_por_id(fac.cliente_id) if fac and fac.cliente_id else None
+            return Resultado("confirmado", "", comp.monto, huno.folio_de(fac),
+                             cli.nombre if cli else None, cli.rut if cli else None)
 
         # 1. Legibilidad
         if comp.es_comprobante is False:
@@ -176,30 +174,30 @@ async def evaluar(comprobante_id: int) -> Resultado:
         if not _cuenta_destino_ok(comp):
             return await _escalar(s, comp, "cuenta_destino_distinta", f"Cuenta leida: {comp.cuenta_destino}")
 
-        # 5. Empresa
-        ruts = await _candidatos_rut(s, comp)
-        if not ruts:
+        # 5. Cliente
+        clientes = await candidatos(s, comp)
+        if not clientes:
             conv = await s.get(Conversacion, comp.telefono)
             if conv and conv.rut_declarado:
                 return await _escalar(s, comp, "cliente_no_encontrado", f"RUT declarado: {conv.rut_declarado}")
             comp.estado, comp.motivo, comp.actualizado_en = "esperando_rut", "", ahora()
             await s.commit()
             return Resultado("esperando_rut", "", comp.monto)
+        por_id = {c.id: c for c in clientes}
+        ruts = sorted({c.rut for c in clientes if c.rut})
 
-        # 6. Factura con saldo exacto
-        facturas = (
-            await s.execute(
-                select(Factura)
-                .where(Factura.rut.in_(ruts), Factura.estado == "pendiente", Factura.saldo == comp.monto)
-                .order_by(Factura.fecha_vencimiento.is_(None), Factura.fecha_vencimiento,
-                          Factura.fecha_emision, Factura.id)
-            )
-        ).scalars().all()
+        # 6. Factura con saldo exacto (Finanzas de app.huno.cl)
+        facturas = [f for f in await huno.facturas_pendientes(s, list(por_id)) if f.saldo == comp.monto]
         if not facturas:
-            return await _escalar(s, comp, "sin_factura_exacta", f"RUT revisados: {', '.join(ruts)}")
-        if len({f.rut for f in facturas}) > 1:
-            return await _escalar(s, comp, "factura_ambigua", f"RUT con ese monto: {', '.join(sorted({f.rut for f in facturas}))}")
+            nombres = ", ".join(c.nombre for c in clientes)
+            return await _escalar(s, comp, "sin_factura_exacta", f"Clientes revisados: {nombres}")
+        # Dos fichas con el mismo RUT cuentan como la misma empresa
+        empresas = {por_id[f.cliente_id].rut or f"id{f.cliente_id}" for f in facturas}
+        if len(empresas) > 1:
+            return await _escalar(s, comp, "factura_ambigua",
+                                  "Clientes con ese monto: " + ", ".join(sorted({por_id[f.cliente_id].nombre for f in facturas})))
         factura = facturas[0]
+        cliente = por_id[factura.cliente_id]
 
         # 7. Movimiento en el banco
         desde = comp.fecha - timedelta(days=int(reglas["dias_antes"]))
@@ -249,15 +247,11 @@ async def evaluar(comprobante_id: int) -> Resultado:
             )
             if rm.rowcount != 1:
                 raise IntegrityError("movimiento usado", None, None)
+            ok, restante = await huno.aplicar_pago(s, factura.id, comp.monto, movimiento.fecha, huno.USUARIO_AGENTE)
+            if not ok or restante != 0:
+                raise IntegrityError("factura cambio", None, None)
             s.add(Pago(factura_id=factura.id, movimiento_id=movimiento.id, comprobante_id=comp.id,
                        monto=comp.monto, origen="agente"))
-            r = await s.execute(
-                update(Factura)
-                .where(Factura.id == factura.id, Factura.estado == "pendiente", Factura.saldo == comp.monto)
-                .values(saldo=0, estado="pagada", actualizado_en=ahora())
-            )
-            if r.rowcount != 1:
-                raise IntegrityError("factura cambio", None, None)
             comp.estado, comp.motivo = "confirmado", ""
             comp.factura_id, comp.movimiento_id = factura.id, movimiento.id
             comp.actualizado_en = ahora()
@@ -267,10 +261,8 @@ async def evaluar(comprobante_id: int) -> Resultado:
             comp = await s.get(Comprobante, comprobante_id)
             return await _escalar(s, comp, "conflicto")
 
-        cliente = await s.get(Cliente, factura.rut)
         logger.info(f"Pago confirmado: comprobante #{comp.id} -> factura {factura.folio} / movimiento #{movimiento.id}")
-        return Resultado("confirmado", "", comp.monto, factura.folio,
-                         cliente.razon_social if cliente else factura.rut, factura.rut)
+        return Resultado("confirmado", "", comp.monto, factura.folio, cliente.nombre, cliente.rut)
 
 
 async def reevaluar_pendientes(telefono: str | None = None, estados=("pendiente_banco", "esperando_rut")) -> list[tuple[Comprobante, Resultado]]:

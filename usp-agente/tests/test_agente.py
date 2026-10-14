@@ -11,9 +11,10 @@ import httpx
 import pytest
 from sqlalchemy import func, select
 
-from agent import comprobantes, conciliacion, flujo, importadores, llm, main, memoria
+from agent import comprobantes, conciliacion, flujo, huno, importadores, llm, main, memoria
 from agent.comprobantes import DatosComprobante
-from agent.db import Comprobante, Escalamiento, Factura, Movimiento, Pago, async_session, hoy_chile
+from agent.db import (AbonoHuno, ClienteHuno, Comprobante, Escalamiento, FacturaHuno, Movimiento, Pago,
+                      async_session, hoy_chile)
 from agent.providers.base import Adjunto, MensajeEntrante
 from agent.utils import normalizar_rut, normalizar_telefono, parsear_monto
 
@@ -27,9 +28,38 @@ FECHA = date(2026, 10, 10)
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
+_ids = {"factura": 100}
+
+
+async def nuevo_cliente(cid, rut, nombre, telefonos=None):
+    """Simula una ficha de cliente de app.huno.cl."""
+    async with async_session() as s:
+        s.add(ClienteHuno(id=cid, rut=rut, nombre=nombre, nombre_empresa=nombre, telefonos=telefonos, activo=True))
+        await s.commit()
+    huno.invalidar_cache()
+
+
+async def nueva_factura(cliente_id, folio, monto, pagado=False, emision=date(2026, 10, 1), abonos=()):
+    """Simula una factura de Finanzas de app.huno.cl."""
+    _ids["factura"] += 1
+    async with async_session() as s:
+        s.add(FacturaHuno(id=_ids["factura"], cliente_id=cliente_id, folio=folio, monto=monto, pagado=pagado,
+                          fecha_emision=emision, anio=emision.year, mes=emision.month))
+        for a in abonos:
+            s.add(AbonoHuno(factura_id=_ids["factura"], monto=a))
+        await s.commit()
+    return _ids["factura"]
+
+
 async def cargar_ejemplos(cartola=True):
-    await importadores.importar_facturas((EJ / "facturas_ejemplo.csv").read_bytes(), "f.csv")
-    await importadores.importar_contactos((EJ / "contactos_ejemplo.csv").read_bytes(), "c.csv")
+    # Formatos distintos de clientes.telefonos, a proposito
+    await nuevo_cliente(1, "76.123.456-0", "Comercial Atacama Ltda", "María Pérez +56 9 1111 2222")
+    await nuevo_cliente(2, "77654321-7", "Inversiones Elqui SpA", '[{"nombre": "Juan Soto", "telefono": "9 3333 4444"}]')
+    await nuevo_cliente(3, "76999888-8", "Transportes Copayapu SpA", None)
+    await nueva_factura(1, "1501", 230000)
+    await nueva_factura(2, "1502", 420000)
+    await nueva_factura(3, "1503", 690000)
+    await nueva_factura(1, "1450", 230000, pagado=True, emision=date(2026, 9, 1))
     if cartola:
         await importadores.importar_cartola((EJ / "cartola_bci_ejemplo.csv").read_bytes(), "c.csv")
 
@@ -57,8 +87,13 @@ async def enviar_comprobante(proveedor, monkeypatch, tel, d, archivo=b"img", eve
 
 
 async def estado_factura(folio):
+    """(factura, saldo) leidos de las tablas de app.huno.cl."""
     async with async_session() as s:
-        return (await s.execute(select(Factura).where(Factura.folio == folio))).scalars().one()
+        f = (await s.execute(select(FacturaHuno).where(FacturaHuno.folio == folio))).scalars().one()
+        abonos = (await s.execute(select(func.coalesce(func.sum(AbonoHuno.monto), 0))
+                                  .where(AbonoHuno.factura_id == f.id))).scalar_one()
+    return SimpleNamespace(id=f.id, pagado=bool(f.pagado), saldo=0 if f.pagado else f.monto - abonos,
+                           fecha_pago=f.fecha_pago, usuario_pago=f.usuario_pago)
 
 
 async def contar(modelo, *cond):
@@ -117,11 +152,24 @@ async def test_importar_cartola_excel(db, tmp_path):
     assert r.nuevos == 1, r.dict()
 
 
-async def test_importar_facturas_no_reabre_pagadas(db):
+def test_parsear_telefonos_de_la_ficha():
+    p = huno.parsear_telefonos
+    assert p("María Pérez +56 9 1111 2222") == [("56911112222", "María Pérez")]
+    assert p('[{"nombre": "Juan", "telefono": "9 3333 4444"}]') == [("56933334444", "Juan")]
+    assert p("Juan: 912345678, Ana: +56 9 8765 4321") == [("56912345678", "Juan"), ("56987654321", "Ana")]
+    assert p("+56912345678 (dueño)\n+56 9 2222 3333 contadora") == [("56912345678", "dueño"), ("56922223333", "contadora")]
+    assert p('["+56 9 1111 2222", "+56 9 3333 4444"]') == [("56911112222", None), ("56933334444", None)]
+    assert p("") == [] and p(None) == [] and p("sin telefono") == []
+
+
+async def test_lee_clientes_y_saldo_con_abonos(db):
     await cargar_ejemplos(cartola=False)
-    assert (await estado_factura("1450")).estado == "pagada"
-    assert (await estado_factura("1501")).saldo == 230000
-    assert await contar(Factura) == 4
+    await nueva_factura(1, "1700", 100000, abonos=(30000, 20000))
+    assert [c.nombre for c in await huno.clientes_de_telefono(TEL_JUAN)] == ["Inversiones Elqui SpA"]
+    assert [c.id for c in await huno.clientes_de_rut("76123456-0")] == [1]
+    async with async_session() as s:
+        pend = await huno.facturas_pendientes(s, [1])
+    assert [(f.folio, f.saldo) for f in pend] == [("1501", 230000), ("1700", 50000)]  # 1450 esta pagada
 
 
 # ── conciliacion ─────────────────────────────────────────────────────────
@@ -132,7 +180,7 @@ async def test_confirma_pago_exacto(db, proveedor, monkeypatch):
     resp = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, op="884512"))
     assert "Pago confirmado" in resp[0] and "1501" in resp[0] and "$230.000" in resp[0]
     f = await estado_factura("1501")
-    assert f.estado == "pagada" and f.saldo == 0
+    assert f.pagado and f.fecha_pago == date(2026, 10, 10) and f.usuario_pago == huno.USUARIO_AGENTE
     async with async_session() as s:
         m = (await s.execute(select(Movimiento).where(Movimiento.monto == 230000))).scalars().one()
     assert m.disponible == 0
@@ -201,7 +249,7 @@ async def test_cuenta_destino_distinta_se_escala(db, proveedor, monkeypatch):
     await cargar_ejemplos()
     await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, cuenta="****9999"))
     assert await contar(Escalamiento, Escalamiento.motivo == "cuenta_destino_distinta") == 1
-    assert (await estado_factura("1501")).estado == "pendiente"
+    assert not (await estado_factura("1501")).pagado
 
 
 async def test_monto_alto_se_escala(db, proveedor, monkeypatch):
@@ -225,12 +273,10 @@ async def test_no_es_comprobante(db, proveedor, monkeypatch):
 
 async def test_dos_facturas_mismo_monto_paga_la_mas_antigua(db, proveedor, monkeypatch):
     await cargar_ejemplos()
-    nueva = ("Folio;RUT;Razón social;Total;Vencimiento\n"
-             "1600;76.123.456-0;Comercial Atacama Ltda;$230.000;10/11/2026\n").encode()
-    await importadores.importar_facturas(nueva, "f.csv")
+    await nueva_factura(1, "1600", 230000, emision=date(2026, 11, 1))
     resp = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, op="884512"))
     assert "1501" in resp[0]
-    assert (await estado_factura("1600")).estado == "pendiente"
+    assert not (await estado_factura("1600")).pagado
 
 
 async def test_movimientos_ambiguos_se_escalan(db, proveedor, monkeypatch):
@@ -245,10 +291,10 @@ async def test_movimientos_ambiguos_se_escalan(db, proveedor, monkeypatch):
 async def test_misma_transferencia_no_se_usa_dos_veces(db, proveedor, monkeypatch):
     """Dos clientes distintos dicen haber pagado con la misma transferencia del banco."""
     await cargar_ejemplos(cartola=False)
-    facturas = ("Folio;RUT;Razón social;Total\n2001;12.345.678-5;Uno;$50.000\n2002;15.111.222-6;Dos;$50.000\n").encode()
-    await importadores.importar_facturas(facturas, "f.csv")
-    await importadores.agregar_contacto("+56 9 7777 0001", "12345678-5")
-    await importadores.agregar_contacto("+56 9 7777 0002", "15111222-6")
+    await nuevo_cliente(11, "12.345.678-5", "Uno", "+56 9 7777 0001")
+    await nuevo_cliente(12, "15.111.222-6", "Dos", "+56 9 7777 0002")
+    await nueva_factura(11, "2001", 50000)
+    await nueva_factura(12, "2002", 50000)
     await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSFERENCIA;50.000\n", "c.csv")
     r1 = await enviar_comprobante(proveedor, monkeypatch, "56977770001", datos(50000), archivo=b"x1", evento="a")
     r2 = await enviar_comprobante(proveedor, monkeypatch, "56977770002", datos(50000), archivo=b"x2", evento="b")
@@ -399,7 +445,7 @@ async def test_panel_cartola_confirma_y_avisa(db, proveedor, monkeypatch):
 
 async def test_panel_confirmacion_manual_pago_de_dos_facturas(db, proveedor, monkeypatch):
     await cargar_ejemplos(cartola=False)
-    await importadores.importar_facturas(b"Folio;RUT;Razon social;Total\n1601;76.123.456-0;Comercial Atacama;$100.000\n", "f.csv")
+    await nueva_factura(1, "1601", 100000)
     await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSF;330.000\n", "c.csv")
     await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(330000))  # no calza: se escala
     async with async_session() as s:
@@ -417,7 +463,7 @@ async def test_panel_confirmacion_manual_pago_de_dos_facturas(db, proveedor, mon
                           json={"factura_id": f2, "movimiento_id": mid})
     assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
     assert r3.status_code == 409
-    assert (await estado_factura("1501")).estado == "pagada" and (await estado_factura("1601")).estado == "pagada"
+    assert (await estado_factura("1501")).pagado and (await estado_factura("1601")).pagado
     async with async_session() as s:
         assert (await s.get(Movimiento, mid)).disponible == 0
         pago = (await s.execute(select(Pago).where(Pago.factura_id == f1))).scalars().one()
@@ -540,10 +586,10 @@ async def test_concurrencia_misma_transferencia(db):
     """Dos comprobantes evaluados AL MISMO TIEMPO no pueden usar la misma plata."""
     import asyncio
 
-    facturas = ("Folio;RUT;Razón social;Total\n3001;12.345.678-5;Uno;$70.000\n3002;15.111.222-6;Dos;$70.000\n").encode()
-    await importadores.importar_facturas(facturas, "f.csv")
-    await importadores.agregar_contacto("+56 9 7777 0001", "12345678-5")
-    await importadores.agregar_contacto("+56 9 7777 0002", "15111222-6")
+    await nuevo_cliente(11, "12.345.678-5", "Uno", "+56 9 7777 0001")
+    await nuevo_cliente(12, "15.111.222-6", "Dos", "+56 9 7777 0002")
+    await nueva_factura(11, "3001", 70000)
+    await nueva_factura(12, "3002", 70000)
     await importadores.importar_cartola(f"Fecha;Descripcion;Abonos\n{hoy_chile():%d/%m/%Y};TRANSF;70.000\n".encode(), "c.csv")
     ids = []
     async with async_session() as s:
@@ -574,3 +620,52 @@ async def test_adjunto_no_soportado_y_audio(db, proveedor):
     r, _ = await flujo.procesar(proveedor, MensajeEntrante(
         telefono=TEL_MARIA, texto="", mensaje_id="y", adjuntos=[Adjunto(tipo="audio", url="a")], contexto={}))
     assert "audios" in r[0]
+
+
+# ── integracion con app.huno.cl ──────────────────────────────────────────
+
+
+async def test_saludo_usa_nombre_de_la_ficha(db, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    from agent import cerebro
+
+    assert (await cerebro.regla_rapida(TEL_MARIA, "hola")).startswith("Hola María,")
+    assert (await cerebro.regla_rapida(TEL_DESCONOCIDO, "hola")).startswith("Hola, le saluda")
+
+
+async def test_pago_parcial_desde_panel_queda_como_abono(db, proveedor, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    await memoria.registrar_entrante(TEL_MARIA, {"conversation_id": "conv-m", "account_id": "acc"}, None)
+    await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSF;100.000\n", "c.csv")
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(100000))  # no calza: se escala
+    async with async_session() as s:
+        cid = (await s.execute(select(Comprobante.id))).scalar_one()
+        mid = (await s.execute(select(Movimiento.id))).scalar_one()
+    fid = (await estado_factura("1501")).id
+    async with await _cliente(proveedor) as c:
+        r = await c.post(f"/admin/api/comprobantes/{cid}/confirmar", headers=H,
+                         json={"factura_id": fid, "movimiento_id": mid, "avisar_cliente": True})
+        clientes = (await c.get("/admin/api/clientes", headers=H)).json()
+    assert r.status_code == 200 and r.json()["saldo_restante"] == 130000, r.text
+    f = await estado_factura("1501")
+    assert not f.pagado and f.saldo == 130000
+    assert await contar(AbonoHuno, AbonoHuno.factura_id == fid, AbonoHuno.monto == 100000) == 1
+    assert "Saldo pendiente de esa factura: $130.000" in proveedor.enviados[-1][1]
+    atacama = next(x for x in clientes if x["id"] == 1)
+    assert atacama["telefonos"] == [{"telefono": TEL_MARIA, "nombre": "María Pérez"}]
+
+
+async def test_ia_sabe_quien_escribe(db, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    capturas = []
+
+    async def crear_falso(**kw):
+        capturas.append(kw["system"])
+        return SimpleNamespace(stop_reason="end_turn", content=[_bloque(type="text", text="ok")])
+    monkeypatch.setattr(llm, "crear_mensaje", crear_falso)
+    from agent import cerebro
+
+    await cerebro.responder(TEL_JUAN, "necesito ayuda con mi cuenta")
+    await cerebro.responder(TEL_DESCONOCIDO, "necesito ayuda con mi cuenta")
+    assert "Juan Soto" in capturas[0][1]["text"] and "Inversiones Elqui SpA" in capturas[0][1]["text"]
+    assert "NO esta registrado" in capturas[1][1]["text"]
