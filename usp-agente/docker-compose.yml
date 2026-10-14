@@ -1,0 +1,10 @@
+# Solo para probar en local con Docker. En produccion se usa Railway.
+services:
+  agente:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      PORT: 8000
+    restart: unless-stopped

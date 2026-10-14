@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Panel USP — HUNO®</title>
+<style>
+  :root{--navy:#081f2c;--azul:#54b2e9;--fondo:#f4f7fa;--borde:#d9e2ea;--texto:#14232e;--suave:#5b6b78;--ok:#1f8a4c;--alerta:#c0392b;--aviso:#b7791f}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--fondo);color:var(--texto);font-size:14px}
+  header{background:var(--navy);color:#fff;padding:14px 20px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header .marca{font-weight:700;font-size:20px;letter-spacing:.5px}
+  header .marca span{color:var(--azul)}
+  header .sub{opacity:.75}
+  header .der{margin-left:auto;display:flex;gap:8px;align-items:center}
+  main{max-width:1200px;margin:0 auto;padding:16px}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+  .tile{background:#fff;border:1px solid var(--borde);border-radius:8px;padding:12px}
+  .tile .n{font-size:24px;font-weight:700;color:var(--navy)}
+  .tile .l{color:var(--suave);font-size:12px;margin-top:2px}
+  .tile.rojo .n{color:var(--alerta)}
+  nav{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px}
+  nav button{background:#fff;border:1px solid var(--borde);color:var(--navy);padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600}
+  nav button.activo{background:var(--navy);color:#fff;border-color:var(--navy)}
+  section{display:none;background:#fff;border:1px solid var(--borde);border-radius:8px;padding:16px}
+  section.activo{display:block}
+  h2{margin:0 0 12px;font-size:17px;color:var(--navy)}
+  .caso{border:1px solid var(--borde);border-radius:8px;padding:12px;margin-bottom:10px}
+  .caso .cab{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px}
+  .etq{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;background:#e8f4fc;color:var(--navy)}
+  .etq.rojo{background:#fbe9e7;color:var(--alerta)}
+  .etq.ok{background:#e6f4ec;color:var(--ok)}
+  .etq.gris{background:#eef1f4;color:var(--suave)}
+  .resumen{white-space:pre-wrap;color:var(--suave);margin:6px 0}
+  .acciones{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  button.b{background:var(--azul);color:#fff;border:0;padding:7px 12px;border-radius:6px;cursor:pointer;font-weight:600}
+  button.b.sec{background:#fff;color:var(--navy);border:1px solid var(--borde)}
+  button.b.ok{background:var(--ok)}
+  button:disabled{opacity:.5;cursor:default}
+  input,select{padding:8px;border:1px solid var(--borde);border-radius:6px;font-size:14px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--borde);vertical-align:top}
+  th{color:var(--suave);font-weight:600}
+  .fila-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  .ayuda{color:var(--suave);font-size:13px;margin:4px 0 10px}
+  pre.res{background:var(--fondo);padding:10px;border-radius:6px;white-space:pre-wrap;font-size:12px}
+  .detalle select{width:100%;max-width:640px}
+  .tabla{overflow-x:auto}
+  html,body{overflow-x:hidden}
+  .detalle{margin-top:10px;padding-top:10px;border-top:1px dashed var(--borde)}
+  .visor{max-width:100%;max-height:480px;border:1px solid var(--borde);border-radius:6px}
+  #login{max-width:380px;margin:80px auto;background:#fff;border:1px solid var(--borde);border-radius:8px;padding:24px}
+  #login input{width:100%;margin:6px 0 12px}
+  .vacio{color:var(--suave);padding:20px;text-align:center}
+  #toast{position:fixed;bottom:16px;right:16px;background:var(--navy);color:#fff;padding:10px 14px;border-radius:6px;display:none;max-width:360px}
+</style>
+</head>
+<body>
+<header>
+  <div class="marca">HUNO<span>®</span></div>
+  <div class="sub">USP · Agente de cobranzas WhatsApp</div>
+  <div class="der" id="sesion" hidden>
+    <span id="quien"></span>
+    <button class="b sec" id="salir">Salir</button>
+  </div>
+</header>
+
+<div id="login">
+  <h2>Ingreso al panel USP</h2>
+  <label>Tu nombre (queda registrado en cada acción)</label>
+  <input id="inNombre" autocomplete="name">
+  <label>Token de acceso</label>
+  <input id="inToken" type="password" autocomplete="current-password">
+  <button class="b" id="entrar">Entrar</button>
+  <p class="ayuda" id="loginError"></p>
+</div>
+
+<main id="app" hidden>
+  <div class="tiles" id="tiles"></div>
+  <nav id="tabs">
+    <button data-t="casos" class="activo">Casos abiertos</button>
+    <button data-t="cartola">Cargar cartola BCI</button>
+    <button data-t="facturas">Cargar facturas</button>
+    <button data-t="contactos">Contactos</button>
+    <button data-t="avisar">Confirmados sin avisar</button>
+    <button data-t="comprobantes">Comprobantes</button>
+  </nav>
+
+  <section id="t-casos" class="activo">
+    <h2>Casos derivados por el agente</h2>
+    <div id="listaCasos"></div>
+  </section>
+
+  <section id="t-cartola">
+    <h2>Cartola BCI Pyme</h2>
+    <p class="ayuda">Descarga la cartola desde BCI Pyme (Excel o CSV) y súbela aquí. Solo se guardan los abonos. Subir la misma cartola dos veces no duplica movimientos. Al cargarla, el agente vuelve a revisar los comprobantes en espera y avisa por WhatsApp los que se confirmen.</p>
+    <div class="fila-form"><input type="file" id="fCartola" accept=".csv,.xlsx,.txt"><button class="b" id="bCartola">Subir cartola</button></div>
+    <pre class="res" id="rCartola" hidden></pre>
+  </section>
+
+  <section id="t-facturas">
+    <h2>Facturas pendientes</h2>
+    <p class="ayuda">Exporta desde Facto las facturas emitidas (Excel o CSV) con folio, RUT, razón social, total y, si existe, saldo y vencimiento. Las facturas que el agente ya marcó como pagadas no se vuelven a abrir.</p>
+    <div class="fila-form"><input type="file" id="fFacturas" accept=".csv,.xlsx,.txt"><button class="b" id="bFacturas">Subir facturas</button></div>
+    <pre class="res" id="rFacturas" hidden></pre>
+  </section>
+
+  <section id="t-contactos">
+    <h2>Teléfonos autorizados por cliente</h2>
+    <p class="ayuda">Solo un teléfono registrado puede consultar las facturas de esa empresa por WhatsApp. Archivo con columnas: teléfono, RUT y, opcional, nombre y razón social.</p>
+    <div class="fila-form"><input type="file" id="fContactos" accept=".csv,.xlsx,.txt"><button class="b" id="bContactos">Subir contactos</button></div>
+    <div class="fila-form">
+      <input id="cTel" placeholder="+56 9 1234 5678">
+      <input id="cRut" placeholder="RUT empresa 76.123.456-7">
+      <input id="cNom" placeholder="Nombre contacto (opcional)">
+      <input id="cRaz" placeholder="Razón social (si es nueva)">
+      <button class="b" id="bContacto">Agregar</button>
+    </div>
+    <pre class="res" id="rContactos" hidden></pre>
+  </section>
+
+  <section id="t-avisar">
+    <h2>Pagos confirmados que no se pudieron avisar</h2>
+    <p class="ayuda">Pasaron más de 24 horas desde el último mensaje del cliente y WhatsApp no permite escribirle texto libre. Avísale desde el celular de USP (o con una plantilla aprobada).</p>
+    <div id="listaAvisar"></div>
+  </section>
+
+  <section id="t-comprobantes">
+    <h2>Últimos comprobantes</h2>
+    <div class="fila-form">
+      <select id="filtroEstado">
+        <option value="">Todos</option><option>confirmado</option><option>pendiente_banco</option>
+        <option>esperando_rut</option><option>escalado</option><option>no_legible</option><option>duplicado</option>
+      </select>
+      <button class="b sec" id="bFiltrar">Filtrar</button>
+    </div>
+    <div id="listaComp"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const ESTADOS = {confirmado:['Confirmado','ok'],pendiente_banco:['Esperando banco',''],esperando_rut:['Falta RUT',''],
+    escalado:['En revisión','rojo'],no_legible:['No legible','gris'],duplicado:['Reenvío','gris'],recibido:['Recibido','gris']};
+  let token = '', nombre = '';
+  try { token = sessionStorage.getItem('uspToken') || ''; nombre = sessionStorage.getItem('uspNombre') || ''; } catch (e) {}
+
+  function el(tag, attrs = {}, ...hijos) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'class') n.className = v; else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
+      else if (v !== undefined && v !== null) n.setAttribute(k, v);
+    }
+    for (const h of hijos.flat()) if (h !== null && h !== undefined) n.append(h instanceof Node ? h : document.createTextNode(String(h)));
+    return n;
+  }
+  function toast(t) { const x = $('toast'); x.textContent = t; x.style.display = 'block'; clearTimeout(x._t); x._t = setTimeout(() => x.style.display = 'none', 4500); }
+  const fecha = (iso) => iso ? new Date(iso).toLocaleString('es-CL', {dateStyle: 'short', timeStyle: 'short'}) : '';
+  const etiqueta = (estado) => { const [t, c] = ESTADOS[estado] || [estado, 'gris']; return el('span', {class: 'etq ' + c}, t); };
+
+  async function api(ruta, opciones = {}) {
+    const headers = Object.assign({'X-Admin-Token': token, 'X-Usuario': encodeURIComponent(nombre)}, opciones.headers || {});
+    const r = await fetch(ruta, Object.assign({}, opciones, {headers}));
+    if (r.status === 401) { salir(); throw new Error('Token incorrecto'); }
+    const tipo = r.headers.get('content-type') || '';
+    const datos = tipo.includes('json') ? await r.json() : await r.blob();
+    if (!r.ok) throw new Error((datos && datos.detail) || ('Error ' + r.status));
+    return datos;
+  }
+  const post = (ruta, cuerpo) => api(ruta, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cuerpo || {})});
+
+  async function entrar() {
+    token = $('inToken').value.trim(); nombre = $('inNombre').value.trim() || 'panel';
+    try {
+      await api('/admin/api/resumen');
+      try { sessionStorage.setItem('uspToken', token); sessionStorage.setItem('uspNombre', nombre); } catch (e) {}
+      mostrarApp();
+    } catch (e) { $('loginError').textContent = e.message; }
+  }
+  function salir() {
+    token = ''; try { sessionStorage.removeItem('uspToken'); } catch (e) {}
+    $('app').hidden = true; $('sesion').hidden = true; $('login').hidden = false;
+  }
+  function mostrarApp() {
+    $('login').hidden = true; $('app').hidden = false; $('sesion').hidden = false; $('quien').textContent = nombre;
+    cargarResumen(); cargarCasos();
+  }
+
+  async function cargarResumen() {
+    const r = await api('/admin/api/resumen');
+    const tiles = [
+      ['casos_abiertos', 'Casos abiertos', r.casos_abiertos > 0],
+      ['confirmados_24h', 'Pagos confirmados (24 h)'],
+      ['pendientes_banco', 'Esperando banco'],
+      ['esperando_rut', 'Esperando RUT'],
+      ['confirmados_sin_avisar', 'Confirmados sin avisar', r.confirmados_sin_avisar > 0],
+      ['facturas_pendientes', 'Facturas pendientes'],
+    ];
+    $('tiles').replaceChildren(...tiles.map(([k, l, rojo]) => el('div', {class: 'tile' + (rojo ? ' rojo' : '')}, el('div', {class: 'n'}, r[k]), el('div', {class: 'l'}, l))),
+      el('div', {class: 'tile'}, el('div', {class: 'n', style: 'font-size:16px'}, r.ultimo_movimiento || '—'), el('div', {class: 'l'}, 'Último movimiento cargado')));
+  }
+
+  function filaComprobante(c) {
+    return el('div', {},
+      el('b', {}, c.monto_txt || 'Monto no leído'), ' · ', c.fecha || 'sin fecha', ' · op ', c.numero_operacion || '—',
+      el('br'), 'Origen: ', c.nombre_origen || '—', ' ', c.rut_origen || '', ' (', c.banco_origen || '—', ') · Cuenta destino: ', c.cuenta_destino || '—');
+  }
+
+  async function verArchivo(c, cont) {
+    const blob = await api('/admin/api/comprobantes/' + c.id + '/archivo');
+    const url = URL.createObjectURL(blob);
+    const visor = blob.type === 'application/pdf' ? el('object', {data: url, type: 'application/pdf', class: 'visor', style: 'width:100%;height:480px'}) : el('img', {src: url, class: 'visor', alt: 'Comprobante'});
+    cont.replaceChildren(visor);
+  }
+
+  async function confirmarManual(c, cont) {
+    const cand = await api('/admin/api/candidatos/' + c.id);
+    const selF = el('select', {}, el('option', {value: ''}, 'Factura…'), cand.facturas.map(f => el('option', {value: f.id}, `N° ${f.folio} · ${f.razon_social || f.rut} · ${f.saldo_txt} · vence ${f.vencimiento || '—'}`)));
+    const selM = el('select', {}, el('option', {value: ''}, 'Movimiento del banco…'), cand.movimientos.map(m => el('option', {value: m.id}, `${m.fecha} · ${m.monto_txt} (disp. ${m.disponible_txt}) · ${m.descripcion.slice(0, 60)}`)));
+    const chk = el('input', {type: 'checkbox', checked: 'checked', id: 'av' + c.id});
+    const boton = el('button', {class: 'b ok', onclick: async () => {
+      if (!selF.value || !selM.value) return toast('Elige factura y movimiento');
+      boton.disabled = true;
+      try {
+        const r = await post('/admin/api/comprobantes/' + c.id + '/confirmar', {factura_id: +selF.value, movimiento_id: +selM.value, avisar_cliente: chk.checked});
+        toast('Pago registrado. Saldo restante de la factura: $' + r.saldo_restante.toLocaleString('es-CL') + (r.aviso.avisados ? ' · cliente avisado' : (chk.checked ? ' · NO se pudo avisar (fuera de 24 h)' : '')));
+        cargarResumen(); cargarCasos();
+      } catch (e) { toast(e.message); boton.disabled = false; }
+    }}, 'Registrar pago');
+    cont.replaceChildren(
+      el('p', {class: 'ayuda'}, 'Para un pago de varias facturas, registra una factura a la vez con el mismo movimiento.'),
+      el('div', {class: 'fila-form'}, selF), el('div', {class: 'fila-form'}, selM),
+      el('div', {class: 'fila-form'}, chk, el('label', {for: 'av' + c.id}, 'Avisar al cliente por WhatsApp'), boton));
+  }
+
+  async function cargarCasos() {
+    const casos = await api('/admin/api/escalamientos?estado=abierto');
+    const lista = $('listaCasos');
+    if (!casos.length) return lista.replaceChildren(el('div', {class: 'vacio'}, 'No hay casos abiertos.'));
+    lista.replaceChildren(...casos.map(c => {
+      const detalle = el('div', {class: 'detalle', hidden: 'hidden'});
+      const abrir = (fn) => async () => { detalle.hidden = false; try { await fn(); } catch (e) { toast(e.message); } };
+      return el('div', {class: 'caso'},
+        el('div', {class: 'cab'}, el('b', {}, '#' + c.id), el('span', {class: 'etq rojo'}, c.motivo_txt),
+          el('a', {href: 'https://wa.me/' + encodeURIComponent(c.telefono), target: '_blank', rel: 'noopener'}, '+' + c.telefono),
+          c.nombre_whatsapp ? el('span', {}, c.nombre_whatsapp) : null,
+          c.pausado ? el('span', {class: 'etq gris'}, 'Agente en pausa') : null,
+          el('span', {class: 'ayuda', style: 'margin:0 0 0 auto'}, fecha(c.creado_en))),
+        el('div', {class: 'resumen'}, c.resumen),
+        c.comprobante ? filaComprobante(c.comprobante) : null,
+        el('div', {class: 'acciones'},
+          c.comprobante && c.comprobante.tiene_archivo ? el('button', {class: 'b sec', onclick: abrir(() => verArchivo(c.comprobante, detalle))}, 'Ver comprobante') : null,
+          c.comprobante ? el('button', {class: 'b', onclick: abrir(() => confirmarManual(c.comprobante, detalle))}, 'Confirmar a mano') : null,
+          c.pausado ? el('button', {class: 'b sec', onclick: async () => { await post('/admin/api/conversaciones/' + c.telefono + '/reanudar'); toast('El agente vuelve a responder'); cargarCasos(); }}, 'Reactivar agente')
+                    : el('button', {class: 'b sec', onclick: async () => { await post('/admin/api/conversaciones/' + c.telefono + '/pausar?horas=12'); toast('Agente en pausa 12 h para este chat'); cargarCasos(); }}, 'Pausar agente'),
+          el('button', {class: 'b sec', onclick: async () => {
+            const nota = prompt('Nota de cierre (opcional):') ?? null; if (nota === null) return;
+            await post('/admin/api/escalamientos/' + c.id + '/resolver', {nota}); toast('Caso cerrado'); cargarResumen(); cargarCasos();
+          }}, 'Cerrar caso')),
+        detalle);
+    }));
+  }
+
+  async function subir(input, ruta, salida) {
+    const f = $(input).files[0]; if (!f) return toast('Elige un archivo');
+    const fd = new FormData(); fd.append('archivo', f);
+    $(salida).hidden = false; $(salida).textContent = 'Procesando…';
+    try { $(salida).textContent = JSON.stringify(await api(ruta, {method: 'POST', body: fd}), null, 2); cargarResumen(); }
+    catch (e) { $(salida).textContent = 'Error: ' + e.message; }
+  }
+
+  async function cargarComprobantes(contenedor, query) {
+    const lista = await api('/admin/api/comprobantes' + query);
+    if (!lista.length) return contenedor.replaceChildren(el('div', {class: 'vacio'}, 'Sin resultados.'));
+    contenedor.replaceChildren(el('div', {class: 'tabla'}, el('table', {},
+      el('thead', {}, el('tr', {}, ['#', 'Recibido', 'WhatsApp', 'Monto', 'Fecha', 'Origen', 'Estado', ''].map(t => el('th', {}, t)))),
+      el('tbody', {}, lista.map(c => {
+        const visor = el('td', {});
+        return el('tr', {}, el('td', {}, c.id), el('td', {}, fecha(c.creado_en)),
+          el('td', {}, el('a', {href: 'https://wa.me/' + encodeURIComponent(c.telefono), target: '_blank', rel: 'noopener'}, '+' + c.telefono)),
+          el('td', {}, c.monto_txt || '—'), el('td', {}, c.fecha || '—'), el('td', {}, (c.nombre_origen || '') + ' ' + (c.rut_origen || '')),
+          el('td', {}, etiqueta(c.estado), c.motivo ? el('div', {class: 'ayuda'}, c.motivo) : null),
+          c.tiene_archivo ? el('td', {}, el('button', {class: 'b sec', onclick: async () => {
+            const blob = await api('/admin/api/comprobantes/' + c.id + '/archivo'); window.open(URL.createObjectURL(blob), '_blank', 'noopener');
+          }}, 'Ver')) : el('td', {}));
+      })))));
+  }
+
+  $('entrar').onclick = entrar;
+  $('inToken').addEventListener('keydown', e => { if (e.key === 'Enter') entrar(); });
+  $('salir').onclick = salir;
+  $('bCartola').onclick = () => subir('fCartola', '/admin/api/cartola', 'rCartola');
+  $('bFacturas').onclick = () => subir('fFacturas', '/admin/api/facturas', 'rFacturas');
+  $('bContactos').onclick = () => subir('fContactos', '/admin/api/contactos/archivo', 'rContactos');
+  $('bContacto').onclick = async () => {
+    $('rContactos').hidden = false;
+    try { $('rContactos').textContent = JSON.stringify(await post('/admin/api/contactos', {telefono: $('cTel').value, rut: $('cRut').value, nombre: $('cNom').value || null, razon_social: $('cRaz').value || null}), null, 2); }
+    catch (e) { $('rContactos').textContent = 'Error: ' + e.message; }
+  };
+  $('bFiltrar').onclick = () => cargarComprobantes($('listaComp'), $('filtroEstado').value ? '?estado=' + encodeURIComponent($('filtroEstado').value) : '');
+  document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
+    document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('activo', x === b));
+    document.querySelectorAll('main section').forEach(s => s.classList.toggle('activo', s.id === 't-' + b.dataset.t));
+    if (b.dataset.t === 'casos') cargarCasos();
+    if (b.dataset.t === 'avisar') cargarComprobantes($('listaAvisar'), '?sin_avisar=true');
+    if (b.dataset.t === 'comprobantes') cargarComprobantes($('listaComp'), '');
+  });
+  if (token) mostrarApp(); else $('inNombre').value = nombre;
+  setInterval(() => { if (token && !$('app').hidden) cargarResumen().catch(() => {}); }, 60000);
+})();
+</script>
+</body>
+</html>

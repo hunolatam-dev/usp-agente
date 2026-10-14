@@ -1,0 +1,43 @@
+# Datos de USP (Unidad de Servicios y Pagos) de HUNO®
+# Todo lo que diga "COMPLETAR" hay que llenarlo antes de producción.
+
+negocio:
+  nombre: "HUNO®"
+  area: "USP — Unidad de Servicios y Pagos"
+  whatsapp: "+56 9 7870 1038"
+  horario: "lunes a viernes de 9:00 a 18:00 hrs"
+  correo_cobranza: "COMPLETAR@huno.cl"
+  sucursales:
+    - "Copiapó: Los Carrera #401"
+    - "La Serena: Cristóbal Colón #352"
+
+agente:
+  nombre: "Asistente USP de HUNO®"
+  tono: "profesional, cercano y breve"
+
+# Datos para transferir. Se le entregan al cliente tal cual.
+datos_transferencia:
+  titular: "COMPLETAR (razón social de HUNO)"
+  rut: "COMPLETAR"
+  banco: "BCI"
+  tipo_cuenta: "Cuenta Corriente"
+  numero_cuenta: "COMPLETAR"
+  correo: "COMPLETAR@huno.cl"
+
+# Cuentas de HUNO que reciben pagos. Si el comprobante muestra una cuenta destino
+# distinta (comparando los últimos 4 dígitos), el pago NO se confirma y va a una persona.
+# Dejar vacío desactiva este control (no recomendado).
+cuentas_destino:
+  - "COMPLETAR número de cuenta BCI"
+
+# Reglas de confirmación automática
+reglas:
+  # Días que puede tardar en aparecer en la cartola un pago respecto de la fecha del comprobante
+  dias_antes: 1
+  dias_despues: 4
+  # Si el comprobante es más antiguo que esto y no aparece en el banco, se escala
+  dias_espera_banco: 3
+  # Sobre este monto (CLP) nunca se confirma solo; lo revisa una persona
+  monto_maximo_auto: 3000000
+  # Horas que el agente se queda callado cuando un ejecutivo responde desde el celular
+  pausa_humano_horas: 12

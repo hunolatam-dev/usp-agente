@@ -1,0 +1,5 @@
+Folio;Tipo;RUT Cliente;Razón Social;Fecha Emisión;Vencimiento;Total;Saldo;Estado
+1501;33;76.123.456-0;Comercial Atacama Ltda;01/10/2026;10/10/2026;$230.000;$230.000;Pendiente
+1502;33;77.654.321-7;Inversiones Elqui SpA;01/10/2026;10/10/2026;$420.000;$420.000;Pendiente
+1503;34;76.999.888-8;Transportes Copayapu SpA;01/10/2026;10/10/2026;$690.000;$690.000;Pendiente
+1450;33;76.123.456-0;Comercial Atacama Ltda;01/09/2026;10/09/2026;$230.000;$0;Pagada

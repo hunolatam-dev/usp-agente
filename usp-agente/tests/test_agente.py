@@ -1,0 +1,576 @@
+"""Pruebas del agente USP: importadores, conciliacion, webhook, panel y conversacion."""
+
+import hashlib
+import hmac
+import json
+from datetime import date, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from sqlalchemy import func, select
+
+from agent import comprobantes, conciliacion, flujo, importadores, llm, main, memoria
+from agent.comprobantes import DatosComprobante
+from agent.db import Comprobante, Escalamiento, Factura, Movimiento, Pago, async_session, hoy_chile
+from agent.providers.base import Adjunto, MensajeEntrante
+from agent.utils import normalizar_rut, normalizar_telefono, parsear_monto
+
+EJ = Path(__file__).resolve().parent.parent / "ejemplos"
+TEL_MARIA = "56911112222"   # contacto de Comercial Atacama (76.123.456-0)
+TEL_JUAN = "56933334444"    # contacto de Inversiones Elqui (77.654.321-7)
+TEL_DESCONOCIDO = "56955556666"
+FECHA = date(2026, 10, 10)
+
+
+# ── helpers ──────────────────────────────────────────────────────────────
+
+
+async def cargar_ejemplos(cartola=True):
+    await importadores.importar_facturas((EJ / "facturas_ejemplo.csv").read_bytes(), "f.csv")
+    await importadores.importar_contactos((EJ / "contactos_ejemplo.csv").read_bytes(), "c.csv")
+    if cartola:
+        await importadores.importar_cartola((EJ / "cartola_bci_ejemplo.csv").read_bytes(), "c.csv")
+
+
+def datos(monto, fecha=FECHA, op=None, cuenta="12-345-4321", rut_origen=None, es=True):
+    return DatosComprobante(es_comprobante=es, legible=monto is not None, monto=monto, fecha=fecha,
+                            numero_operacion=op, cuenta_destino=cuenta, rut_origen=rut_origen,
+                            banco_origen="Banco Estado", nombre_origen="Cliente")
+
+
+def mensaje(tel, texto="", url=None, evento="ev"):
+    adj = [Adjunto(tipo="image", url=url, mime="image/jpeg")] if url else []
+    return MensajeEntrante(telefono=tel, texto=texto, mensaje_id=evento, adjuntos=adj,
+                           contexto={"evento_id": evento, "conversation_id": "conv-" + tel, "account_id": "acc"})
+
+
+async def enviar_comprobante(proveedor, monkeypatch, tel, d, archivo=b"img", evento="ev1"):
+    async def leer_falso(contenido, mime):
+        return d
+    monkeypatch.setattr(comprobantes, "leer", leer_falso)
+    url = f"https://zernio.com/api/v1/whatsapp/media/{evento}"
+    proveedor.archivos[url] = (b"\xff\xd8" + archivo, "image/jpeg")
+    respuestas, _ = await flujo.procesar(proveedor, mensaje(tel, url=url, evento=evento))
+    return respuestas
+
+
+async def estado_factura(folio):
+    async with async_session() as s:
+        return (await s.execute(select(Factura).where(Factura.folio == folio))).scalars().one()
+
+
+async def contar(modelo, *cond):
+    async with async_session() as s:
+        return (await s.execute(select(func.count()).select_from(modelo).where(*cond))).scalar_one()
+
+
+# ── utilidades ───────────────────────────────────────────────────────────
+
+
+def test_rut_monto_telefono():
+    assert normalizar_rut("76.123.456-0") == "76123456-0"
+    assert normalizar_rut("76.123.456-1") is None
+    assert normalizar_rut("12345678-5") == "12345678-5"
+    assert parsear_monto("$1.234.567") == 1234567
+    assert parsear_monto("230.000,00") == 230000
+    assert parsear_monto(230000.0) == 230000
+    assert normalizar_telefono("+56 9 7870 1038") == "56978701038"
+    assert normalizar_telefono("978701038") == "56978701038"
+
+
+def test_interpretar_salida_del_modelo():
+    d = comprobantes.interpretar({"es_comprobante": True, "legible": True, "monto": "$230.000",
+                                  "fecha": "2026-10-10", "rut_origen": "76.123.456-0", "numero_operacion": " 884512 "})
+    assert d.monto == 230000 and d.fecha == FECHA and d.rut_origen == "76123456-0" and d.numero_operacion == "884512"
+    futura = comprobantes.interpretar({"es_comprobante": True, "legible": True, "monto": "1000",
+                                       "fecha": (hoy_chile() + timedelta(days=5)).isoformat()})
+    assert futura.fecha is None and futura.legible is False
+
+
+# ── importadores ─────────────────────────────────────────────────────────
+
+
+async def test_importar_cartola_sin_duplicar(db):
+    contenido = (EJ / "cartola_bci_ejemplo.csv").read_bytes()
+    r1 = await importadores.importar_cartola(contenido, "cartola.csv")
+    assert r1.nuevos == 3 and r1.omitidos == 1, r1.dict()  # el cargo se omite
+    r2 = await importadores.importar_cartola(contenido, "cartola.csv")
+    assert r2.nuevos == 0
+    async with async_session() as s:
+        m = (await s.execute(select(Movimiento).where(Movimiento.monto == 230000))).scalars().one()
+    assert m.rut_origen == "76123456-0" and m.documento == "884512" and m.disponible == 230000
+
+
+async def test_importar_cartola_excel(db, tmp_path):
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Movimientos BCI"])
+    ws.append(["Fecha", "Glosa", "Depósitos", "Giros", "Saldo"])
+    ws.append([date(2026, 10, 13), "TRANSFERENCIA DE 12.345.678-5", 99000, None, 1000000])
+    ruta = tmp_path / "c.xlsx"
+    wb.save(ruta)
+    r = await importadores.importar_cartola(ruta.read_bytes(), "c.xlsx")
+    assert r.nuevos == 1, r.dict()
+
+
+async def test_importar_facturas_no_reabre_pagadas(db):
+    await cargar_ejemplos(cartola=False)
+    assert (await estado_factura("1450")).estado == "pagada"
+    assert (await estado_factura("1501")).saldo == 230000
+    assert await contar(Factura) == 4
+
+
+# ── conciliacion ─────────────────────────────────────────────────────────
+
+
+async def test_confirma_pago_exacto(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, op="884512"))
+    assert "Pago confirmado" in resp[0] and "1501" in resp[0] and "$230.000" in resp[0]
+    f = await estado_factura("1501")
+    assert f.estado == "pagada" and f.saldo == 0
+    async with async_session() as s:
+        m = (await s.execute(select(Movimiento).where(Movimiento.monto == 230000))).scalars().one()
+    assert m.disponible == 0
+
+
+async def test_mismo_comprobante_reenviado_no_paga_dos_veces(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, op="884512"), archivo=b"A", evento="e1")
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, op="884512"), archivo=b"A", evento="e2")
+    assert "Pago confirmado" in resp[0]  # se informa el estado del original
+    assert await contar(Pago) == 1
+
+
+async def test_comprobante_de_otro_chat_se_escala(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, op="884512"), archivo=b"A", evento="e1")
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_JUAN, datos(230000, op="884512"), archivo=b"A", evento="e2")
+    assert "ejecutivo" in resp[0]
+    assert await contar(Escalamiento, Escalamiento.motivo == "comprobante_reutilizado") == 1
+    assert await contar(Pago) == 1
+
+
+async def test_pendiente_banco_y_confirmacion_al_cargar_cartola(db, proveedor, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    hoy = hoy_chile()
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_JUAN, datos(420000, fecha=hoy))
+    assert "Aún no se refleja" in resp[0]
+    cartola = f"Fecha;Descripción;Abonos\n{hoy.strftime('%d/%m/%Y')};TRANSF DE 77.654.321-7;420.000\n".encode()
+    await importadores.importar_cartola(cartola, "c.csv")
+    resultados = await conciliacion.reevaluar_pendientes(estados=("pendiente_banco",))
+    from agent import avisos
+
+    aviso = await avisos.avisar_confirmaciones(proveedor, resultados)
+    assert aviso == {"avisados": 1, "sin_avisar": 0}
+    assert "Pago confirmado" in proveedor.enviados[-1][1]
+    assert proveedor.enviados[-1][2]["conversation_id"] == "conv-" + TEL_JUAN
+
+
+async def test_comprobante_viejo_sin_movimiento_se_escala(db, proveedor, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_JUAN, datos(420000, fecha=hoy_chile() - timedelta(days=10)))
+    assert "ejecutivo" in resp[0]
+    assert await contar(Escalamiento, Escalamiento.motivo == "sin_movimiento") == 1
+
+
+async def test_telefono_desconocido_pide_rut_y_confirma(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_DESCONOCIDO, datos(690000, fecha=date(2026, 10, 12)))
+    assert "RUT de la empresa" in resp[0]
+    respuestas, _ = await flujo.procesar(proveedor, mensaje(TEL_DESCONOCIDO, "es 76.999.888-8", evento="e9"))
+    assert "Pago confirmado" in respuestas[0] and "1503" in respuestas[0]
+
+
+async def test_rut_declarado_no_permite_ver_deuda(db):
+    await cargar_ejemplos()
+    from agent import herramientas
+
+    await memoria.guardar_rut_declarado(TEL_DESCONOCIDO, "76123456-0")
+    r = await herramientas.consultar_facturas_pendientes(TEL_DESCONOCIDO)
+    assert r == {"resultado": "telefono_no_registrado"}
+    r = await herramientas.consultar_facturas_pendientes(TEL_MARIA)
+    assert r["empresas"][0]["total_pendiente"] == "$230.000"
+
+
+async def test_cuenta_destino_distinta_se_escala(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, cuenta="****9999"))
+    assert await contar(Escalamiento, Escalamiento.motivo == "cuenta_destino_distinta") == 1
+    assert (await estado_factura("1501")).estado == "pendiente"
+
+
+async def test_monto_alto_se_escala(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(5_000_000))
+    assert await contar(Escalamiento, Escalamiento.motivo == "monto_alto") == 1
+
+
+async def test_sin_factura_exacta_se_escala(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(100000))
+    assert await contar(Escalamiento, Escalamiento.motivo == "sin_factura_exacta") == 1
+
+
+async def test_no_es_comprobante(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(None, es=False))
+    assert "no parece un comprobante" in resp[0]
+    assert await contar(Escalamiento) == 0
+
+
+async def test_dos_facturas_mismo_monto_paga_la_mas_antigua(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    nueva = ("Folio;RUT;Razón social;Total;Vencimiento\n"
+             "1600;76.123.456-0;Comercial Atacama Ltda;$230.000;10/11/2026\n").encode()
+    await importadores.importar_facturas(nueva, "f.csv")
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, op="884512"))
+    assert "1501" in resp[0]
+    assert (await estado_factura("1600")).estado == "pendiente"
+
+
+async def test_movimientos_ambiguos_se_escalan(db, proveedor, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    cartola = ("Fecha;Descripción;Abonos\n10/10/2026;TRANSFERENCIA DE TERCEROS;230.000\n"
+               "10/10/2026;OTRA TRANSFERENCIA;230.000\n").encode()
+    await importadores.importar_cartola(cartola, "c.csv")
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000))
+    assert await contar(Escalamiento, Escalamiento.motivo == "movimiento_ambiguo") == 1
+
+
+async def test_misma_transferencia_no_se_usa_dos_veces(db, proveedor, monkeypatch):
+    """Dos clientes distintos dicen haber pagado con la misma transferencia del banco."""
+    await cargar_ejemplos(cartola=False)
+    facturas = ("Folio;RUT;Razón social;Total\n2001;12.345.678-5;Uno;$50.000\n2002;15.111.222-6;Dos;$50.000\n").encode()
+    await importadores.importar_facturas(facturas, "f.csv")
+    await importadores.agregar_contacto("+56 9 7777 0001", "12345678-5")
+    await importadores.agregar_contacto("+56 9 7777 0002", "15111222-6")
+    await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSFERENCIA;50.000\n", "c.csv")
+    r1 = await enviar_comprobante(proveedor, monkeypatch, "56977770001", datos(50000), archivo=b"x1", evento="a")
+    r2 = await enviar_comprobante(proveedor, monkeypatch, "56977770002", datos(50000), archivo=b"x2", evento="b")
+    assert "Pago confirmado" in r1[0]
+    assert "Pago confirmado" not in r2[0]
+    assert await contar(Pago) == 1
+
+
+# ── webhook ──────────────────────────────────────────────────────────────
+
+
+def _payload_recibido(tel="+56911112222", texto="hola", adjuntos=None, evento="evt_1"):
+    return {
+        "id": evento, "event": "message.received",
+        "message": {"id": "m1", "conversationId": "conv1", "platform": "whatsapp", "platformMessageId": "wamid.1",
+                    "direction": "incoming", "text": texto, "attachments": adjuntos or [],
+                    "sender": {"id": tel.lstrip("+"), "phoneNumber": tel, "name": "María"},
+                    "sentAt": "2026-10-14T12:00:00Z", "isRead": False},
+        "conversation": {"id": "conv1", "platformConversationId": "x", "participantId": tel.lstrip("+"), "status": "active"},
+        "account": {"id": "acc1", "accountId": "acc1", "platform": "whatsapp", "username": "huno"},
+        "timestamp": "2026-10-14T12:00:00Z",
+    }
+
+
+async def _cliente(proveedor):
+    main.proveedor = proveedor
+    main.app.state.proveedor = proveedor
+    main.error_configuracion = None
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
+
+
+async def test_webhook_saludo_sin_tokens_y_deduplicacion(db, proveedor):
+    async with await _cliente(proveedor) as c:
+        r = await c.post("/webhook", content=json.dumps(_payload_recibido()))
+        assert r.status_code == 200 and r.json()["encolados"] == 1
+        r = await c.post("/webhook", content=json.dumps(_payload_recibido()))
+        assert r.json()["encolados"] == 0
+    assert len(proveedor.enviados) == 1
+    tel, texto, ctx = proveedor.enviados[0]
+    assert tel == TEL_MARIA and "asistente de USP" in texto and ctx["conversation_id"] == "conv1"
+
+
+async def test_webhook_comprobante_de_punta_a_punta(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+
+    async def leer_falso(contenido, mime):
+        assert contenido == b"%PDF-1.7 datos" and mime == "application/pdf"
+        return datos(230000, op="884512")
+    monkeypatch.setattr(comprobantes, "leer", leer_falso)
+    url = "https://zernio.com/api/v1/whatsapp/media/123"
+    proveedor.archivos[url] = (b"%PDF-1.7 datos", "application/octet-stream")
+    adj = [{"type": "file", "url": url, "mimeType": "application/pdf"}]
+    async with await _cliente(proveedor) as c:
+        r = await c.post("/webhook", content=json.dumps(_payload_recibido(texto="", adjuntos=adj, evento="evt_c")))
+        assert r.json()["encolados"] == 1
+    assert "Pago confirmado" in proveedor.enviados[-1][1]
+    assert (await memoria.obtener_historial(TEL_MARIA))[0]["content"].startswith("[Envio un archivo")
+
+
+async def test_ejecutivo_responde_desde_celular_pausa_agente(db, proveedor):
+    async with await _cliente(proveedor) as c:
+        await c.post("/webhook", content=json.dumps(_payload_recibido(evento="e1")))
+        enviado_humano = _payload_recibido(evento="e2")
+        enviado_humano["event"] = "message.sent"
+        enviado_humano["message"].update(direction="outgoing", sentVia="human", text="Hola María, lo reviso")
+        await c.post("/webhook", content=json.dumps(enviado_humano))
+        await c.post("/webhook", content=json.dumps(_payload_recibido(texto="gracias", evento="e3")))
+    assert len(proveedor.enviados) == 1  # solo el primer saludo
+    assert await memoria.esta_pausada(TEL_MARIA)
+    # Los mensajes del propio agente (sentVia=api) no pausan
+    await memoria.reanudar(TEL_MARIA)
+    async with await _cliente(proveedor) as c:
+        propio = _payload_recibido(evento="e4")
+        propio["event"] = "message.sent"
+        propio["message"].update(direction="outgoing", sentVia="api")
+        await c.post("/webhook", content=json.dumps(propio))
+    assert not await memoria.esta_pausada(TEL_MARIA)
+
+
+async def test_firma_obligatoria_en_produccion(db, monkeypatch):
+    from agent.providers.zernio import ProveedorZernio
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("ZERNIO_WEBHOOK_SECRET", "")
+    sin_secreto = ProveedorZernio()
+    async with await _cliente(sin_secreto) as c:
+        r = await c.post("/webhook", content=json.dumps(_payload_recibido()))
+        assert r.status_code == 401
+
+    monkeypatch.setenv("ZERNIO_WEBHOOK_SECRET", "secreto")
+    con_secreto = ProveedorZernio()
+    con_secreto.api_key = ""  # no intentara enviar de verdad
+    cuerpo = json.dumps(_payload_recibido(evento="firm")).encode()
+    firma = hmac.new(b"secreto", cuerpo, hashlib.sha256).hexdigest()
+    async with await _cliente(con_secreto) as c:
+        assert (await c.post("/webhook", content=cuerpo, headers={"X-Zernio-Signature": "malo"})).status_code == 401
+        assert (await c.post("/webhook", content=cuerpo, headers={"X-Zernio-Signature": firma})).status_code == 200
+
+
+async def test_api_key_no_se_envia_a_otros_dominios(monkeypatch):
+    from agent.providers import zernio
+
+    vistos = []
+
+    class ClienteFalso:
+        def __init__(self, **kw): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): ...
+        async def get(self, url, headers=None):
+            vistos.append((url, headers))
+            return SimpleNamespace(status_code=200, content=b"x", headers={"content-type": "image/png"}, text="")
+
+    monkeypatch.setattr(zernio.httpx, "AsyncClient", ClienteFalso)
+    p = zernio.ProveedorZernio()
+    p.api_key = "sk_secreta"
+    await p.descargar_adjunto(Adjunto(tipo="image", url="https://zernio.com/api/v1/whatsapp/media/1"))
+    await p.descargar_adjunto(Adjunto(tipo="image", url="https://malicioso.example/img.png"))
+    await p.descargar_adjunto(Adjunto(tipo="image", url="/v1/whatsapp/media/2"))
+    assert vistos[0][1] == {"Authorization": "Bearer sk_secreta"}
+    assert vistos[1][1] == {}
+    assert vistos[2][0].startswith("https://zernio.com/") and vistos[2][1]
+
+
+# ── panel ────────────────────────────────────────────────────────────────
+
+
+H = {"X-Admin-Token": "token-de-prueba-123456", "X-Usuario": "Ana%20USP"}
+
+
+async def test_panel_requiere_token(db, proveedor):
+    async with await _cliente(proveedor) as c:
+        assert (await c.get("/admin/api/resumen")).status_code == 401
+        assert (await c.get("/admin/api/resumen", headers={"X-Admin-Token": "x"})).status_code == 401
+        assert (await c.get("/admin/api/resumen", headers=H)).status_code == 200
+        assert (await c.get("/admin")).status_code == 200
+
+
+async def test_panel_cartola_confirma_y_avisa(db, proveedor, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    await memoria.registrar_entrante(TEL_JUAN, {"conversation_id": "conv-j", "account_id": "acc"}, None)
+    await enviar_comprobante(proveedor, monkeypatch, TEL_JUAN, datos(420000, fecha=hoy_chile()))
+    cartola = f"Fecha;Descripción;Abonos\n{hoy_chile().strftime('%d/%m/%Y')};TRANSF;420.000\n".encode()
+    async with await _cliente(proveedor) as c:
+        r = await c.post("/admin/api/cartola", headers=H, files={"archivo": ("cartola.csv", cartola, "text/csv")})
+    assert r.status_code == 200, r.text
+    assert r.json()["comprobantes_reevaluados"] == {"confirmado": 1} and r.json()["avisos"]["avisados"] == 1
+
+
+async def test_panel_confirmacion_manual_pago_de_dos_facturas(db, proveedor, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    await importadores.importar_facturas(b"Folio;RUT;Razon social;Total\n1601;76.123.456-0;Comercial Atacama;$100.000\n", "f.csv")
+    await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSF;330.000\n", "c.csv")
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(330000))  # no calza: se escala
+    async with async_session() as s:
+        cid = (await s.execute(select(Comprobante.id))).scalar_one()
+        mid = (await s.execute(select(Movimiento.id))).scalar_one()
+    f1, f2 = (await estado_factura("1501")).id, (await estado_factura("1601")).id
+    async with await _cliente(proveedor) as c:
+        cand = (await c.get(f"/admin/api/candidatos/{cid}", headers=H)).json()
+        assert {f["folio"] for f in cand["facturas"]} == {"1501", "1601"}
+        r1 = await c.post(f"/admin/api/comprobantes/{cid}/confirmar", headers=H,
+                          json={"factura_id": f1, "movimiento_id": mid, "avisar_cliente": False})
+        r2 = await c.post(f"/admin/api/comprobantes/{cid}/confirmar", headers=H,
+                          json={"factura_id": f2, "movimiento_id": mid, "avisar_cliente": False})
+        r3 = await c.post(f"/admin/api/comprobantes/{cid}/confirmar", headers=H,
+                          json={"factura_id": f2, "movimiento_id": mid})
+    assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+    assert r3.status_code == 409
+    assert (await estado_factura("1501")).estado == "pagada" and (await estado_factura("1601")).estado == "pagada"
+    async with async_session() as s:
+        assert (await s.get(Movimiento, mid)).disponible == 0
+        pago = (await s.execute(select(Pago).where(Pago.factura_id == f1))).scalars().one()
+    assert pago.registrado_por == "Ana USP"
+    assert await contar(Escalamiento, Escalamiento.estado == "abierto") == 0
+
+
+# ── conversacion con Claude (simulado) ───────────────────────────────────
+
+
+def _bloque(**kw):
+    b = SimpleNamespace(**kw)
+    b.model_dump = lambda exclude_none=True: {k: v for k, v in kw.items() if v is not None}
+    return b
+
+
+async def test_conversacion_usa_herramienta_de_facturas(db, monkeypatch):
+    await cargar_ejemplos()
+    llamadas = []
+
+    async def crear_falso(**kw):
+        llamadas.append(kw)
+        if len(llamadas) == 1:
+            return SimpleNamespace(stop_reason="tool_use", content=[
+                _bloque(type="tool_use", id="t1", name="consultar_facturas_pendientes", input={})])
+        resultado = json.loads(kw["messages"][-1]["content"][0]["content"])
+        total = resultado["empresas"][0]["total_pendiente"]
+        return SimpleNamespace(stop_reason="end_turn", content=[_bloque(type="text", text=f"Tiene {total} pendiente.")])
+
+    monkeypatch.setattr(llm, "crear_mensaje", crear_falso)
+    from agent import cerebro
+
+    texto, guardar = await cerebro.responder(TEL_MARIA, "cuánto debo?")
+    assert texto == "Tiene $230.000 pendiente." and guardar
+    assert llamadas[0]["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "NUNCA CONFIRMAS UN PAGO" in llamadas[0]["system"][0]["text"]
+    assert "Preguntas frecuentes" in llamadas[0]["system"][0]["text"]
+
+
+async def test_error_de_claude_deriva_a_persona(db, monkeypatch):
+    async def falla(**kw):
+        raise RuntimeError("caido")
+    monkeypatch.setattr(llm, "crear_mensaje", falla)
+    from agent import cerebro
+
+    texto, guardar = await cerebro.responder(TEL_MARIA, "necesito una nota de crédito")
+    assert "ejecutivo" in texto and not guardar
+    assert await contar(Escalamiento) == 1
+
+
+@pytest.mark.parametrize("texto", ["Hola!", "buenas tardes", "gracias", "👍"])
+async def test_reglas_rapidas(db, texto, monkeypatch):
+    async def no_llamar(**kw):
+        raise AssertionError("no deberia llamar a Claude")
+    monkeypatch.setattr(llm, "crear_mensaje", no_llamar)
+    from agent import cerebro
+
+    texto_resp, _ = await cerebro.responder(TEL_MARIA, texto)
+    assert texto_resp
+
+
+# ── SDK real de Anthropic contra un servidor simulado ────────────────────
+
+
+def _cliente_anthropic_simulado(respuestas, peticiones):
+    from anthropic import AsyncAnthropic
+
+    try:  # las versiones nuevas del SDK usan httpx2
+        import httpx2 as hx
+    except ImportError:
+        hx = httpx
+
+    def manejar(req):
+        peticiones.append(json.loads(req.content))
+        return hx.Response(200, json=respuestas.pop(0))
+
+    return AsyncAnthropic(api_key="sk-ant-test", http_client=hx.AsyncClient(transport=hx.MockTransport(manejar)))
+
+
+def _resp(content, stop="end_turn"):
+    return {"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-haiku-5-5", "content": content,
+            "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 5}}
+
+
+async def test_sdk_real_ciclo_de_herramientas(db, monkeypatch):
+    await cargar_ejemplos()
+    peticiones = []
+    respuestas = [
+        _resp([{"type": "text", "text": "Reviso."},
+               {"type": "tool_use", "id": "toolu_1", "name": "consultar_facturas_pendientes", "input": {}}], "tool_use"),
+        _resp([{"type": "text", "text": "Tiene $230.000 pendiente."}]),
+    ]
+    monkeypatch.setattr(llm, "_cliente", _cliente_anthropic_simulado(respuestas, peticiones))
+    from agent import cerebro
+
+    texto, _ = await cerebro.responder(TEL_MARIA, "cuánto debo?")
+    assert texto == "Tiene $230.000 pendiente."
+    segunda = peticiones[1]
+    assert segunda["output_config"] == {"effort": "low"}
+    assert segunda["messages"][-2]["content"][1] == {"type": "tool_use", "id": "toolu_1",
+                                                     "name": "consultar_facturas_pendientes", "input": {}}
+    assert segunda["messages"][-1]["content"][0]["tool_use_id"] == "toolu_1"
+
+
+async def test_sdk_real_lectura_de_comprobante(monkeypatch):
+    peticiones = []
+    respuestas = [_resp([{"type": "tool_use", "id": "toolu_2", "name": "registrar_comprobante",
+                          "input": {"es_comprobante": True, "legible": True, "monto": "$420.000",
+                                    "fecha": "2026-10-11", "numero_operacion": "993100"}}], "tool_use")]
+    monkeypatch.setattr(llm, "_cliente", _cliente_anthropic_simulado(respuestas, peticiones))
+    d = await comprobantes.leer(b"%PDF-1.4 falso", "application/pdf")
+    assert d.monto == 420000 and d.numero_operacion == "993100"
+    p = peticiones[0]
+    assert p["tool_choice"] == {"type": "tool", "name": "registrar_comprobante"}
+    assert p["messages"][0]["content"][0]["type"] == "document"
+    assert await comprobantes.leer(b"x", "video/mp4") is None
+
+
+async def test_concurrencia_misma_transferencia(db):
+    """Dos comprobantes evaluados AL MISMO TIEMPO no pueden usar la misma plata."""
+    import asyncio
+
+    facturas = ("Folio;RUT;Razón social;Total\n3001;12.345.678-5;Uno;$70.000\n3002;15.111.222-6;Dos;$70.000\n").encode()
+    await importadores.importar_facturas(facturas, "f.csv")
+    await importadores.agregar_contacto("+56 9 7777 0001", "12345678-5")
+    await importadores.agregar_contacto("+56 9 7777 0002", "15111222-6")
+    await importadores.importar_cartola(f"Fecha;Descripcion;Abonos\n{hoy_chile():%d/%m/%Y};TRANSF;70.000\n".encode(), "c.csv")
+    ids = []
+    async with async_session() as s:
+        for i, tel in enumerate(["56977770001", "56977770002"]):
+            c = Comprobante(telefono=tel, es_comprobante=True, monto=70000, fecha=hoy_chile(), sha256=f"h{i}")
+            s.add(c)
+            await s.flush()
+            ids.append(c.id)
+        await s.commit()
+    resultados = await asyncio.gather(*(conciliacion.evaluar(i) for i in ids))
+    assert sorted(r.estado for r in resultados).count("confirmado") == 1
+    assert await contar(Pago) == 1
+
+
+async def test_reenvio_de_comprobante_escalado_no_se_redecide(db, proveedor, monkeypatch):
+    await cargar_ejemplos()
+    r1 = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(5_000_000), archivo=b"Z", evento="z1")
+    r2 = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(5_000_000), archivo=b"Z", evento="z2")
+    assert "ejecutivo" in r1[0] and "ejecutivo" in r2[0]
+    assert await contar(Escalamiento) == 1
+
+
+async def test_adjunto_no_soportado_y_audio(db, proveedor):
+    proveedor.archivos["u"] = (b"PK\x03\x04zip", "application/zip")
+    r, _ = await flujo.procesar(proveedor, MensajeEntrante(
+        telefono=TEL_MARIA, texto="", mensaje_id="x", adjuntos=[Adjunto(tipo="file", url="u")], contexto={}))
+    assert "imagen" in r[0]
+    r, _ = await flujo.procesar(proveedor, MensajeEntrante(
+        telefono=TEL_MARIA, texto="", mensaje_id="y", adjuntos=[Adjunto(tipo="audio", url="a")], contexto={}))
+    assert "audios" in r[0]
