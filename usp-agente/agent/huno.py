@@ -49,11 +49,18 @@ def _telefono_valido(digitos: str | None) -> str | None:
     return None
 
 
-def _limpiar_nombre(texto: str) -> str | None:
-    t = re.sub(r"[\d+()\-:|/,;]+", " ", texto or "")
-    t = re.sub(r"\b(tel[eé]fono|telefono|fono|cel(ular)?|whatsapp|wsp|m[oó]vil|n[uú]mero)\b", " ", t, flags=re.I)
+_PALABRAS_NO_NOMBRE = re.compile(
+    r"\b(tel[eé]fonos?|fono|cel(ular)?|whatsapp|wsp|m[oó]vil|n[uú]mero|valor|value|nombre|name|tipo|"
+    r"etiqueta|label|principal|contacto|fijo|oficina|personal|trabajo|null|none|true|false)\b", re.I)
+_RE_NOMBRE_VALIDO = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ'][A-Za-zÁÉÍÓÚÜÑáéíóúüñ' .-]{1,79}$")
+
+
+def _limpiar_nombre(texto: str | None) -> str | None:
+    """Deja solo algo que parezca un nombre de persona; si no, None."""
+    t = re.sub(r"[\d+()\-:|/,;\[\]{}\"'=_]+", " ", str(texto or ""))
+    t = _PALABRAS_NO_NOMBRE.sub(" ", t)
     t = " ".join(t.split()).strip(" .")
-    return t[:80] or None
+    return t if t and _RE_NOMBRE_VALIDO.match(t) else None
 
 
 def parsear_telefonos(texto: str | None) -> list[tuple[str, str | None]]:
@@ -65,26 +72,36 @@ def parsear_telefonos(texto: str | None) -> list[tuple[str, str | None]]:
     def agregar(numero, nombre):
         tel = _telefono_valido(re.sub(r"\D", "", str(numero or "")))
         if tel and tel not in [t for t, _ in salida]:
-            salida.append((tel, (str(nombre).strip()[:80] or None) if nombre else None))
+            salida.append((tel, _limpiar_nombre(nombre)))
 
+    datos = None
     try:
         datos = json.loads(texto)
+        if isinstance(datos, str):  # JSON guardado dos veces como texto
+            datos = json.loads(datos)
     except (ValueError, TypeError):
-        datos = None
+        pass
 
     if isinstance(datos, (list, dict)):
         elementos = datos if isinstance(datos, list) else [datos]
         for e in elementos:
             if isinstance(e, dict):
-                numero = next((e[k] for k in e if re.search(r"tel|fono|num|cel|whats|phone|movil", k, re.I) and e[k]), None)
-                nombre = next((e[k] for k in e if re.search(r"nombre|name|due|contacto|persona|quien", k, re.I) and e[k]), None)
-                if numero:
-                    agregar(numero, nombre)
+                # El numero: cualquier valor que tenga forma de telefono (la clave puede ser
+                # "valor", "telefono", "numero"...). El nombre: la clave que suene a nombre o,
+                # si no hay, otro texto del mismo elemento que parezca nombre de persona.
+                textos = {str(k): str(v) for k, v in e.items() if v not in (None, "")}
+                numeros = [v for v in textos.values() if _RE_NUMERO.search(v) and _telefono_valido(re.sub(r"\D", "", v))]
+                nombre = next((_limpiar_nombre(v) for k, v in textos.items()
+                               if re.search(r"nombre|name|due|persona|quien|contacto|etiqueta|label|desc", k, re.I)
+                               and _limpiar_nombre(v)), None)
+                if nombre is None:
+                    nombre = next((_limpiar_nombre(v) for v in textos.values() if v not in numeros and _limpiar_nombre(v)), None)
+                for n in numeros:
+                    agregar(n, nombre)
             elif isinstance(e, (str, int)):
                 for m in _RE_NUMERO.finditer(str(e)):
                     agregar(m.group(0), _limpiar_nombre(str(e).replace(m.group(0), " ")))
-        if salida:
-            return salida
+        return salida
 
     # Texto libre: se separa por renglones / ; / , y en cada trozo el resto del texto es el nombre
     for trozo in re.split(r"[\n;|]+|,(?!\d)", str(texto)):
@@ -95,15 +112,17 @@ def parsear_telefonos(texto: str | None) -> list[tuple[str, str | None]]:
 
 # ── Cache de clientes ────────────────────────────────────────────────────
 
-_cache: dict = {"t": 0.0, "clientes": []}
+_cache: dict = {"t": None, "clientes": []}
 
 
 def invalidar_cache():
-    _cache["t"] = 0.0
+    _cache["t"] = None
 
 
 async def clientes(forzar: bool = False) -> list[Cliente]:
-    if not forzar and time.monotonic() - _cache["t"] < _TTL and _cache["clientes"]:
+    # Ojo: time.monotonic() puede ser menor que el TTL recien arrancado el contenedor,
+    # por eso "sin cache" es None y no 0.
+    if not forzar and _cache["t"] is not None and time.monotonic() - _cache["t"] < _TTL:
         return _cache["clientes"]
     async with async_session() as s:
         filas = (await s.execute(select(ClienteHuno))).scalars().all()
