@@ -153,6 +153,37 @@ async def cliente_por_id(cid: int) -> Cliente | None:
     return next((c for c in await clientes() if c.id == cid), None)
 
 
+def elegir(texto: str, opciones: list[Cliente]) -> Cliente | None:
+    """
+    Interpreta la respuesta a "¿de cual empresa?": numero de opcion ("2", "la 2"),
+    RUT, o parte del nombre ("elqui"). Devuelve None si no queda claro.
+    """
+    from agent.utils import buscar_ruts, sin_tildes
+
+    t = sin_tildes(texto or "").strip()
+    numeros = re.findall(r"\b(\d{1,2})\b", t)
+    if len(numeros) == 1 and len(t) <= 25 and 1 <= int(numeros[0]) <= len(opciones):
+        return opciones[int(numeros[0]) - 1]
+    for rut in buscar_ruts(texto):
+        hit = [c for c in opciones if c.rut == rut]
+        if len(hit) == 1:
+            return hit[0]
+    palabras = [w for w in re.findall(r"[a-z0-9]{3,}", t)
+                if w not in {"empresa", "la", "el", "de", "del", "spa", "ltda", "limitada", "eirl", "sociedad", "comercial", "consultar", "quiero"}]
+    if palabras:
+        hit = [c for c in opciones if any(w in sin_tildes(c.nombre) for w in palabras)]
+        if len(hit) == 1:
+            return hit[0]
+    return None
+
+
+def lista_opciones(opciones: list[Cliente]) -> str:
+    from agent.utils import formatear_rut
+
+    return "\n".join(f"{i}. {c.nombre}" + (f" ({formatear_rut(c.rut)})" if c.rut else "")
+                     for i, c in enumerate(opciones, 1))
+
+
 # ── Facturas ─────────────────────────────────────────────────────────────
 
 
@@ -168,6 +199,17 @@ class FacturaPendiente:
     anio: int | None
     mes: int | None
     glosa: str | None
+
+    @property
+    def vence(self) -> date | None:
+        """Plazo de pago: N dias corridos desde la emision (config/business.yaml: plazo_pago_dias)."""
+        from datetime import timedelta
+
+        from agent import config
+
+        if not self.fecha_emision:
+            return None
+        return self.fecha_emision + timedelta(days=int(config.negocio().get("plazo_pago_dias") or 15))
 
     @property
     def periodo(self) -> str | None:

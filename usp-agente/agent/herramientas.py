@@ -9,15 +9,25 @@ import json
 from sqlalchemy import select
 
 from agent import conciliacion, escalamientos, huno, memoria
-from agent.db import Comprobante, async_session
+from agent.db import Comprobante, async_session, hoy_chile
 from agent.utils import formatear_monto, formatear_rut, normalizar_rut
 
 DEFINICIONES = [
     {
         "name": "consultar_facturas_pendientes",
-        "description": "Lista las facturas pendientes de pago de las empresas asociadas al telefono del cliente. "
-        "Usala cuando pregunten cuanto deben, que facturas tienen pendientes o montos a pagar.",
-        "input_schema": {"type": "object", "properties": {}},
+        "description": "Lista las facturas pendientes de pago de una empresa asociada al telefono del cliente. "
+        "Usala cuando pregunten cuanto deben, que facturas tienen pendientes o montos a pagar. Si el telefono "
+        "tiene varias empresas y no se indica cual, devuelve las opciones para que el cliente elija.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "empresa": {
+                    "type": "string",
+                    "description": "La empresa que eligio el cliente: numero de opcion, RUT o nombre. "
+                    "Usa 'todas' solo si pide explicitamente todas sus empresas.",
+                }
+            },
+        },
     },
     {
         "name": "estado_comprobantes",
@@ -53,6 +63,7 @@ ETIQUETAS = {
     "confirmado": "pago confirmado",
     "pendiente_banco": "recibido, esperando que se refleje en el banco",
     "esperando_rut": "recibido, falta el RUT de la empresa",
+    "esperando_empresa": "recibido, falta que indique a cual de sus empresas corresponde",
     "escalado": "en revision por un ejecutivo de USP",
     "no_legible": "no se pudo leer; hay que reenviarlo",
     "duplicado": "reenvio de un comprobante anterior",
@@ -60,10 +71,21 @@ ETIQUETAS = {
 }
 
 
-async def consultar_facturas_pendientes(telefono: str) -> dict:
-    clientes = await huno.clientes_de_telefono(telefono)
+async def consultar_facturas_pendientes(telefono: str, empresa: str | None = None) -> dict:
+    clientes = sorted(await huno.clientes_de_telefono(telefono), key=lambda c: c.nombre.lower())
     if not clientes:
         return {"resultado": "telefono_no_registrado"}
+    if len(clientes) > 1 and (empresa or "").strip().lower() not in ("todas", "todos", "all"):
+        elegido = huno.elegir(empresa, clientes) if empresa else None
+        if elegido is None:
+            return {
+                "resultado": "elegir_empresa",
+                "opciones": huno.lista_opciones(clientes),
+                "instruccion": "Este numero esta asociado a varias empresas. Muestra estas opciones tal cual y "
+                "pregunta de cual quiere consultar. No muestres facturas todavia."
+                + (" La respuesta anterior no coincidio con ninguna opcion." if empresa else ""),
+            }
+        clientes = [elegido]
     empresas = []
     async with async_session() as s:
         for c in clientes:
@@ -77,12 +99,15 @@ async def consultar_facturas_pendientes(telefono: str) -> dict:
                      "total_factura": formatear_monto(f.monto),
                      "abonado": formatear_monto(f.abonado) if f.abonado else None,
                      "periodo": f.periodo, "glosa": f.glosa,
-                     "emision": f.fecha_emision.isoformat() if f.fecha_emision else None}
+                     "emision": f.fecha_emision.isoformat() if f.fecha_emision else None,
+                     "vence": f.vence.isoformat() if f.vence else None,
+                     "vencida": bool(f.vence and f.vence < hoy_chile())}
                     for f in facturas[:15]
                 ],
             })
     return {"resultado": "ok", "empresas": empresas,
-            "nota": "Datos de Finanzas de HUNO. Pagos de hoy pueden no estar reflejados todavia."}
+            "nota": "Datos de Finanzas de HUNO. Pagos de hoy pueden no estar reflejados todavia. "
+                    "Si hay facturas vencidas, recuerda con respeto que el no pago bloquea los servicios contratados."}
 
 
 async def estado_comprobantes(telefono: str) -> dict:
@@ -126,7 +151,7 @@ async def escalar_a_persona(telefono: str, motivo: str, resumen: str) -> dict:
 async def ejecutar(nombre: str, entrada: dict, telefono: str) -> str:
     try:
         if nombre == "consultar_facturas_pendientes":
-            r = await consultar_facturas_pendientes(telefono)
+            r = await consultar_facturas_pendientes(telefono, (entrada.get("empresa") or None))
         elif nombre == "estado_comprobantes":
             r = await estado_comprobantes(telefono)
         elif nombre == "registrar_rut_empresa":

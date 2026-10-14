@@ -160,6 +160,13 @@ def test_parsear_telefonos_de_la_ficha():
     assert p("+56912345678 (dueño)\n+56 9 2222 3333 contadora") == [("56912345678", "dueño"), ("56922223333", "contadora")]
     assert p('["+56 9 1111 2222", "+56 9 3333 4444"]') == [("56911112222", None), ("56933334444", None)]
     assert p("") == [] and p(None) == [] and p("sin telefono") == []
+    # Formato de app.huno.cl: lista con la clave "valor"
+    assert p('[{"valor": "+56 9 1111 2222", "nombre": "María Pérez"}]') == [("56911112222", "María Pérez")]
+    assert p('[{"Valor": "+56911112222", "Nombre": "Juan"}, {"Valor": "+56 9 3333 4444", "Nombre": ""}]') == \
+        [("56911112222", "Juan"), ("56933334444", None)]
+    assert p('[{"tipo": "celular", "valor": "912345678"}]') == [("56912345678", None)]
+    assert p('"[{\\"valor\\": \\"912345678\\", \\"nombre\\": \\"Ana\\"}]"') == [("56912345678", "Ana")]
+    assert p('[{"valor": "912345678", "nombre": "[{x}]"}]') == [("56912345678", None)]
 
 
 async def test_lee_clientes_y_saldo_con_abonos(db):
@@ -669,3 +676,70 @@ async def test_ia_sabe_quien_escribe(db, monkeypatch):
     await cerebro.responder(TEL_DESCONOCIDO, "necesito ayuda con mi cuenta")
     assert "Juan Soto" in capturas[0][1]["text"] and "Inversiones Elqui SpA" in capturas[0][1]["text"]
     assert "NO esta registrado" in capturas[1][1]["text"]
+
+
+# ── una persona con varias empresas ──────────────────────────────────────
+
+TEL_DUENO = "56944445555"
+
+
+async def cargar_dueno_con_dos_empresas():
+    await nuevo_cliente(21, "12.345.678-5", "Panadería El Trigo SpA", '[{"valor": "+56 9 4444 5555", "nombre": "Pedro"}]')
+    await nuevo_cliente(22, "15.111.222-6", "Transportes Pedro Ltda", '[{"valor": "+56 9 4444 5555", "nombre": "Pedro"}]')
+    await nueva_factura(21, "5001", 230000)
+    await nueva_factura(22, "5002", 230000)
+    await nueva_factura(22, "5003", 99000)
+
+
+async def test_consulta_de_deuda_pregunta_la_empresa(db):
+    await cargar_dueno_con_dos_empresas()
+    from agent import herramientas
+
+    r = await herramientas.consultar_facturas_pendientes(TEL_DUENO)
+    assert r["resultado"] == "elegir_empresa"
+    assert r["opciones"] == "1. Panadería El Trigo SpA (12.345.678-5)\n2. Transportes Pedro Ltda (15.111.222-6)"
+    r = await herramientas.consultar_facturas_pendientes(TEL_DUENO, "2")
+    assert [e["empresa"] for e in r["empresas"]] == ["Transportes Pedro Ltda"]
+    assert r["empresas"][0]["total_pendiente"] == "$329.000"
+    assert r["empresas"][0]["facturas"][0]["vence"] == "2026-10-16"  # emitida 01-10 + 15 dias
+    r = await herramientas.consultar_facturas_pendientes(TEL_DUENO, "la panaderia")
+    assert [e["empresa"] for e in r["empresas"]] == ["Panadería El Trigo SpA"]
+    r = await herramientas.consultar_facturas_pendientes(TEL_DUENO, "15.111.222-6")
+    assert [e["empresa"] for e in r["empresas"]] == ["Transportes Pedro Ltda"]
+    r = await herramientas.consultar_facturas_pendientes(TEL_DUENO, "todas")
+    assert len(r["empresas"]) == 2
+    r = await herramientas.consultar_facturas_pendientes(TEL_DUENO, "otra cosa")
+    assert r["resultado"] == "elegir_empresa"
+
+
+async def test_comprobante_ambiguo_pregunta_empresa_y_confirma(db, proveedor, monkeypatch):
+    await cargar_dueno_con_dos_empresas()
+    await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSF;230.000\n", "c.csv")
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_DUENO, datos(230000))
+    assert "¿A cuál corresponde el pago?" in resp[0]
+    assert "1. Panadería El Trigo SpA" in resp[0] and "2. Transportes Pedro Ltda" in resp[0]
+    assert await contar(Escalamiento) == 0
+
+    r, _ = await flujo.procesar(proveedor, mensaje(TEL_DUENO, "no se", evento="x1"))
+    assert "No logré identificar la empresa" in r[0]
+    r, _ = await flujo.procesar(proveedor, mensaje(TEL_DUENO, "2", evento="x2"))
+    assert "Pago confirmado" in r[0] and "5002" in r[0] and "Transportes Pedro Ltda" in r[0]
+    assert (await estado_factura("5002")).pagado and not (await estado_factura("5001")).pagado
+
+
+async def test_eleccion_se_conserva_si_espera_banco(db, proveedor, monkeypatch):
+    await cargar_dueno_con_dos_empresas()
+    await enviar_comprobante(proveedor, monkeypatch, TEL_DUENO, datos(230000, fecha=hoy_chile()))
+    r, _ = await flujo.procesar(proveedor, mensaje(TEL_DUENO, "Panadería", evento="y1"))
+    assert "Aún no se refleja" in r[0]
+    await importadores.importar_cartola(f"Fecha;Descripcion;Abonos\n{hoy_chile():%d/%m/%Y};TRANSF;230.000\n".encode(), "c.csv")
+    resultados = await conciliacion.reevaluar_pendientes(estados=("pendiente_banco",))
+    assert [r.estado for _, r in resultados] == ["confirmado"]
+    assert (await estado_factura("5001")).pagado and not (await estado_factura("5002")).pagado
+
+
+async def test_si_solo_una_empresa_calza_no_pregunta(db, proveedor, monkeypatch):
+    await cargar_dueno_con_dos_empresas()
+    await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSF;99.000\n", "c.csv")
+    resp = await enviar_comprobante(proveedor, monkeypatch, TEL_DUENO, datos(99000))
+    assert "Pago confirmado" in resp[0] and "5003" in resp[0]

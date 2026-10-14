@@ -5,8 +5,8 @@ negocio:
   nombre: "HUNO®"
   area: "USP — Unidad de Servicios y Pagos"
   whatsapp: "+56 9 7870 1038"
-  horario: "lunes a viernes de 9:00 a 18:00 hrs"
-  correo_cobranza: "COMPLETAR@huno.cl"
+  horario: "lunes a jueves de 9:00 a 18:00 hrs y viernes de 9:00 a 17:30 hrs (sábados, domingos y festivos cerrado)"
+  correo_cobranza: "pagos@huno.cl"
   sucursales:
     - "Copiapó: Los Carrera #401"
     - "La Serena: Cristóbal Colón #352"
@@ -17,18 +17,21 @@ agente:
 
 # Datos para transferir. Se le entregan al cliente tal cual.
 datos_transferencia:
-  titular: "COMPLETAR (razón social de HUNO)"
-  rut: "COMPLETAR"
-  banco: "BCI"
-  tipo_cuenta: "Cuenta Corriente"
-  numero_cuenta: "COMPLETAR"
-  correo: "COMPLETAR@huno.cl"
+  titular: "HUNO"
+  rut: "77.663.555-3"
+  banco: "Bci / Mach"
+  tipo_cuenta: "Cuenta corriente"
+  numero_cuenta: "89635451"
+  correo: "pagos@huno.cl"
 
 # Cuentas de HUNO que reciben pagos. Si el comprobante muestra una cuenta destino
 # distinta (comparando los últimos 4 dígitos), el pago NO se confirma y va a una persona.
 # Dejar vacío desactiva este control (no recomendado).
 cuentas_destino:
-  - "COMPLETAR número de cuenta BCI"
+  - "89635451"
+
+# Plazo de pago: días corridos desde la emisión de la factura
+plazo_pago_dias: 15
 
 # Reglas de confirmación automática
 reglas:

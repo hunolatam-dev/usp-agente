@@ -40,13 +40,14 @@ logger = logging.getLogger("usp")
 
 @dataclass
 class Resultado:
-    estado: str          # confirmado | pendiente_banco | esperando_rut | escalado | no_legible | no_es_comprobante | duplicado
+    estado: str          # confirmado | pendiente_banco | esperando_rut | esperando_empresa | escalado | no_legible | no_es_comprobante | duplicado
     motivo: str = ""
     monto: int | None = None
     folio: str | None = None
     razon_social: str | None = None
     rut: str | None = None
     saldo: int | None = None  # solo para "abono": lo que queda por pagar
+    opciones: str = ""        # solo para "esperando_empresa": lista numerada
 
     def mensaje(self) -> str:
         campos = {
@@ -55,21 +56,46 @@ class Resultado:
             "folio": self.folio or "",
             "razon_social": self.razon_social or "",
             "rut": self.rut or "",
+            "opciones": self.opciones,
         }
         if self.estado == "escalado" and not self.monto:
             return config.respuesta("recibido_revision")
         return config.respuesta(self.estado, **campos)
 
 
+PREFIJO_ELEGIDA = "empresa_elegida:"
+
+
 async def candidatos(s, comp: Comprobante) -> list[huno.Cliente]:
     """Clientes posibles: los del telefono, y los del RUT declarado o de origen."""
     lista = list(await huno.clientes_de_telefono(comp.telefono))
+    # El cliente ya respondio a cual de sus empresas corresponde este comprobante
+    if comp.motivo and comp.motivo.startswith(PREFIJO_ELEGIDA):
+        elegida = int(comp.motivo.removeprefix(PREFIJO_ELEGIDA))
+        return [c for c in lista if c.id == elegida]
     conv = await s.get(Conversacion, comp.telefono)
     for rut in (conv.rut_declarado if conv else None, comp.rut_origen):
         for c in await huno.clientes_de_rut(rut):
             if c.id not in [x.id for x in lista]:
                 lista.append(c)
     return lista
+
+
+async def opciones_empresa(s, comp: Comprobante) -> list[huno.Cliente]:
+    """Empresas del telefono que tienen una factura pendiente por el monto del comprobante."""
+    del_telefono = await huno.clientes_de_telefono(comp.telefono)
+    con_monto = {f.cliente_id for f in await huno.facturas_pendientes(s, [c.id for c in del_telefono])
+                 if f.saldo == comp.monto}
+    return sorted([c for c in del_telefono if c.id in con_monto], key=lambda c: c.nombre.lower())
+
+
+async def elegir_empresa(comprobante_id: int, cliente_id: int) -> Resultado:
+    """El cliente respondio a cual empresa corresponde el pago: se vuelve a evaluar solo con esa."""
+    async with async_session() as s:
+        comp = await s.get(Comprobante, comprobante_id)
+        comp.estado, comp.motivo, comp.actualizado_en = "recibido", f"{PREFIJO_ELEGIDA}{cliente_id}", ahora()
+        await s.commit()
+    return await evaluar(comprobante_id)
 
 
 def _cuenta_destino_ok(comp: Comprobante) -> bool:
@@ -147,7 +173,7 @@ async def evaluar(comprobante_id: int) -> Resultado:
                 # El cliente reenvio el mismo comprobante: se informa el estado del original
                 comp.estado, comp.motivo = "duplicado", f"reenvio_de_{mismo_chat.id}"
                 await s.commit()
-                if mismo_chat.estado not in ("pendiente_banco", "esperando_rut", "recibido"):
+                if mismo_chat.estado not in ("pendiente_banco", "esperando_rut", "esperando_empresa", "recibido"):
                     # Confirmado, en revision por una persona o ilegible: no se vuelve a decidir
                     if mismo_chat.estado == "confirmado":
                         original = mismo_chat.id
@@ -194,6 +220,13 @@ async def evaluar(comprobante_id: int) -> Resultado:
         # Dos fichas con el mismo RUT cuentan como la misma empresa
         empresas = {por_id[f.cliente_id].rut or f"id{f.cliente_id}" for f in facturas}
         if len(empresas) > 1:
+            del_telefono = {c.id for c in await huno.clientes_de_telefono(comp.telefono)}
+            if {f.cliente_id for f in facturas} <= del_telefono:
+                # Son empresas de la misma persona: se le pregunta a cual corresponde el pago
+                opciones = await opciones_empresa(s, comp)
+                comp.estado, comp.motivo, comp.actualizado_en = "esperando_empresa", "", ahora()
+                await s.commit()
+                return Resultado("esperando_empresa", "", comp.monto, opciones=huno.lista_opciones(opciones))
             return await _escalar(s, comp, "factura_ambigua",
                                   "Clientes con ese monto: " + ", ".join(sorted({por_id[f.cliente_id].nombre for f in facturas})))
         factura = facturas[0]
@@ -213,7 +246,9 @@ async def evaluar(comprobante_id: int) -> Resultado:
 
         if not movs:
             if (hoy_chile() - comp.fecha).days <= int(reglas["dias_espera_banco"]):
-                comp.estado, comp.motivo, comp.actualizado_en = "pendiente_banco", "", ahora()
+                # Se conserva la empresa elegida para cuando aparezca en el banco
+                eleccion = comp.motivo if (comp.motivo or "").startswith(PREFIJO_ELEGIDA) else ""
+                comp.estado, comp.motivo, comp.actualizado_en = "pendiente_banco", eleccion, ahora()
                 await s.commit()
                 return Resultado("pendiente_banco", "", comp.monto)
             return await _escalar(s, comp, "sin_movimiento", f"Factura candidata: N° {factura.folio}")

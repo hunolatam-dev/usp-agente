@@ -116,7 +116,7 @@
     <div class="fila-form">
       <select id="filtroEstado">
         <option value="">Todos</option><option>confirmado</option><option>pendiente_banco</option>
-        <option>esperando_rut</option><option>escalado</option><option>no_legible</option><option>duplicado</option>
+        <option>esperando_rut</option><option>esperando_empresa</option><option>escalado</option><option>no_legible</option><option>duplicado</option>
       </select>
       <button class="b sec" id="bFiltrar">Filtrar</button>
     </div>
@@ -128,7 +128,7 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const ESTADOS = {confirmado:['Confirmado','ok'],pendiente_banco:['Esperando banco',''],esperando_rut:['Falta RUT',''],
+  const ESTADOS = {confirmado:['Confirmado','ok'],pendiente_banco:['Esperando banco',''],esperando_rut:['Falta RUT',''],esperando_empresa:['Falta elegir empresa',''],
     escalado:['En revisión','rojo'],no_legible:['No legible','gris'],duplicado:['Reenvío','gris'],recibido:['Recibido','gris']};
   let token = '', nombre = '';
   try { token = sessionStorage.getItem('uspToken') || ''; nombre = sessionStorage.getItem('uspNombre') || ''; } catch (e) {}

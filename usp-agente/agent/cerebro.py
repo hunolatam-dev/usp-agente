@@ -9,7 +9,7 @@ import re
 
 from sqlalchemy import func, select
 
-from agent import config, herramientas, huno, llm, memoria
+from agent import conciliacion, config, herramientas, huno, llm, memoria
 from agent.db import Comprobante, async_session
 from agent.utils import buscar_ruts, sin_tildes
 
@@ -44,7 +44,31 @@ async def quien_es(telefono: str) -> tuple[str | None, list[str]]:
     return nombre, [c.nombre for c in clientes]
 
 
+async def _eleccion_pendiente(telefono: str, texto: str) -> str | None:
+    """Si hay un comprobante esperando que elija la empresa, interpreta la respuesta."""
+    async with async_session() as s:
+        comp = (await s.execute(
+            select(Comprobante).where(Comprobante.telefono == telefono, Comprobante.estado == "esperando_empresa")
+            .order_by(Comprobante.id)
+        )).scalars().first()
+        if comp is None:
+            return None
+        opciones = await conciliacion.opciones_empresa(s, comp)
+    if not opciones:
+        return None
+    elegido = huno.elegir(texto, opciones)
+    if elegido is None:
+        # Solo se insiste si parece un intento de responder (corto); si no, sigue la conversacion normal
+        if len(texto.strip()) <= 25:
+            return config.respuesta("elegir_no_entendido", opciones=huno.lista_opciones(opciones))
+        return None
+    return (await conciliacion.elegir_empresa(comp.id, elegido.id)).mensaje()
+
+
 async def regla_rapida(telefono: str, texto: str) -> str | None:
+    eleccion = await _eleccion_pendiente(telefono, texto)
+    if eleccion:
+        return eleccion
     t = _limpio(texto)
     if t in _SALUDOS:
         nombre, _ = await quien_es(telefono)
@@ -83,7 +107,8 @@ async def responder(telefono: str, texto: str) -> tuple[str, bool]:
         system.append({"type": "text", "text": (
             "## Quien escribe\nEste numero esta registrado en HUNO"
             + (f" a nombre de {nombre}" if nombre else "")
-            + f", contacto de: {', '.join(empresas)}. Puedes usar consultar_facturas_pendientes.")})
+            + f", contacto de: {', '.join(empresas)}. Puedes usar consultar_facturas_pendientes."
+            + (" Tiene VARIAS empresas: antes de mostrar facturas pregunta de cual." if len(empresas) > 1 else ""))})
     else:
         system.append({"type": "text", "text": (
             "## Quien escribe\nEste numero NO esta registrado en ninguna ficha de cliente de HUNO. "

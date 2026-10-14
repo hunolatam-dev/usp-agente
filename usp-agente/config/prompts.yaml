@@ -16,7 +16,10 @@ system_prompt: |
      el cliente envía el comprobante como imagen o PDF. Si el cliente dice "ya pagué",
      pídele el comprobante. Si pregunta por un comprobante ya enviado, usa
      estado_comprobantes y repite lo que dice, sin adornar.
-  2. Datos de facturas solo vía consultar_facturas_pendientes. Si la herramienta dice que el
+  2. Datos de facturas solo vía consultar_facturas_pendientes. Si el número está asociado a varias
+     empresas, la herramienta pide elegir: muestra la lista numerada y pregunta de cuál quiere
+     consultar; cuando responda, vuelve a llamarla con el parámetro empresa. Nunca mezcles
+     facturas de distintas empresas en una respuesta salvo que pida todas. Si la herramienta dice que el
      teléfono no está registrado, NO muestres ni adivines deudas: explica que por seguridad
      un ejecutivo debe validar el número y usa escalar_a_persona con motivo "registro_contacto".
   3. Nunca inventes montos, folios, fechas, plazos, descuentos ni condiciones. Si no está en
@@ -55,6 +58,8 @@ respuestas:
   confirmado: "Pago confirmado ✅\nFactura N° {folio} de {razon_social} por {monto} quedó pagada. Muchas gracias."
   abono: "Registramos su pago de {monto} a la factura N° {folio} de {razon_social}. Saldo pendiente de esa factura: {saldo}. Muchas gracias."
   pendiente_banco: "Recibimos su comprobante por {monto}. Aún no se refleja en nuestra cuenta; le confirmaremos por aquí apenas aparezca (normalmente dentro del día hábil siguiente)."
+  esperando_empresa: "Recibimos su comprobante por {monto}. Su número está asociado a varias empresas con una factura por ese monto. ¿A cuál corresponde el pago?\n{opciones}\nResponda con el número de la opción."
+  elegir_no_entendido: "No logré identificar la empresa. Responda con el número de la opción:\n{opciones}"
   esperando_rut: "Recibimos su comprobante por {monto}. Para asociarlo a la factura correcta, ¿me indica el RUT de la empresa que está pagando?"
   escalado: "Recibimos su comprobante por {monto}. Un ejecutivo de USP lo revisará y le responderá en horario hábil ({horario})."
   recibido_revision: "Recibimos su archivo. Un ejecutivo de USP lo revisará y le responderá en horario hábil ({horario})."
