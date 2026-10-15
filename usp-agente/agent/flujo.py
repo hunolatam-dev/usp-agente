@@ -12,6 +12,7 @@ Todo mensaje recibe respuesta, salvo que la conversacion la este atendiendo un e
   tambien se responde; si trae un RUT, se usa para asociar el comprobante.
 """
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -203,6 +204,9 @@ async def procesar(proveedor: ProveedorWhatsApp, msg: MensajeEntrante) -> tuple[
             return avisos, "\n".join(notas)
         await memoria.guardar_mensaje(msg.telefono, "user", "\n".join(notas))
         return [], None
+
+    # "escribiendo..." mientras se prepara la respuesta (en paralelo, no la demora)
+    asyncio.ensure_future(proveedor.indicar_escribiendo(msg.contexto))
 
     # Un RUT escrito junto al comprobante sirve para asociarlo (nunca para ver deudas)
     if adjuntos and texto:

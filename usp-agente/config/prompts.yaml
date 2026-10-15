@@ -98,6 +98,14 @@ respuestas:
   servicios: "En HUNO® tenemos 5 servicios:\n{{servicios}}\nLos valores comienzan en {{calculado.precio_desde}} mensuales, según lo que necesite su empresa. ¿Quiere que un ejecutivo le prepare una cotización?"
   servicios_cotizador: "En HUNO® tenemos 5 servicios:\n{{servicios}}\nLos valores comienzan en {{calculado.precio_desde}} mensuales. Puede cotizar su plan en {{cotizador_url}}: indica lo que necesita y le llega el valor mensual a su correo."
 
+  # Consulta de facturas (sin IA si el numero tiene una sola empresa)
+  al_dia: "{empresa} está al día: no tiene facturas pendientes. ¿Necesita el detalle de sus pagos o tiene algún otro requerimiento?"
+  facturas_pendientes: "{empresa} tiene {cantidad} factura(s) pendiente(s) por un total de {total}:\n{lista}{extras}\n\nSi ya pagó alguna, envíe el comprobante por aquí y lo validamos."
+  aviso_vencidas: "Hay facturas vencidas: el no pago deja a la empresa bloqueada de los servicios contratados hasta regularizar."
+  aviso_comprobante_en_espera: "Recibimos su comprobante por {monto}; se confirmará apenas se refleje en nuestra cuenta."
+  pagos_realizados: "Últimos pagos de {empresa}:\n{lista}\n\n¿Necesita algo más?"
+  sin_pagos: "No encontramos pagos registrados de {empresa}. Si necesita un detalle mayor, un ejecutivo de USP puede ayudarle."
+
   # Resultados de validar un comprobante. {monto}, {folio}, {razon_social}, {rut} se reemplazan.
   confirmado: "Pago confirmado ✅\nFactura N° {folio} de {razon_social} por {monto} quedó pagada. Muchas gracias."
   confirmado_varias: "Pago confirmado ✅\nFacturas N° {folio} de {razon_social}, por un total de {monto}, quedaron pagadas. Muchas gracias."

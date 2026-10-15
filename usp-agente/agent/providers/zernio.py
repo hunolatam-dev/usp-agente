@@ -199,6 +199,23 @@ class ProveedorZernio(ProveedorWhatsApp):
         logger.error(f"Zernio rechazo el envio [{r.status_code}]: {r.text[:300]}")
         return False
 
+    async def indicar_escribiendo(self, contexto: dict) -> None:
+        """POST /inbox/conversations/{id}/typing: el cliente ve "escribiendo..." (y el mensaje queda leido).
+        Si falla no pasa nada: es solo para que la espera se sienta mas corta."""
+        conversation_id = (contexto or {}).get("conversation_id")
+        account_id = (contexto or {}).get("account_id") or self.account_id
+        if not self.api_key or not conversation_id or not account_id:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as cliente:
+                r = await cliente.post(f"{self.base_url}/inbox/conversations/{conversation_id}/typing",
+                                       json={"accountId": account_id},
+                                       headers={"Authorization": f"Bearer {self.api_key}"})
+            if r.status_code >= 300:
+                logger.debug(f"Indicador de escritura no aceptado [{r.status_code}]")
+        except httpx.HTTPError:
+            pass
+
     async def verificar_conexion(self) -> tuple[bool, str]:
         if not self.api_key:
             return False, "Falta ZERNIO_API_KEY"

@@ -110,7 +110,7 @@ async def test_pedir_una_persona_deriva_sin_tokens(db, monkeypatch):
     assert (await ultimo_caso()).motivo == "pedido_cliente"
 
 
-@pytest.mark.parametrize("texto", ["quiero dar de baja mi plan", "cuánto debo de mi factura?",
+@pytest.mark.parametrize("texto", ["quiero dar de baja mi plan", "por qué me cobraron dos veces la factura?",
                                    "pagué en cuotas, a qué cuenta?", "me equivoqué de cuenta al transferir"])
 async def test_frases_con_matiz_van_a_la_ia(db, monkeypatch, texto):
     await cargar_ejemplos(cartola=False)
@@ -326,13 +326,13 @@ async def test_mensajes_seguidos_se_responden_juntos(db, proveedor, monkeypatch)
     llamadas = ia_falsa(monkeypatch, "Tiene $230.000 pendiente.")
     monkeypatch.setattr(main, "AGRUPAR_SEGUNDOS", 0.05)
     main.proveedor = proveedor
-    m1, m2 = mensaje(TEL_MARIA, "hola", evento="a1"), mensaje(TEL_MARIA, "cuánto debo?", evento="a2")
+    m1, m2 = mensaje(TEL_MARIA, "hola", evento="a1"), mensaje(TEL_MARIA, "quiero revisar el monto que tengo que pagar", evento="a2")
 
     async def despues(m):
         await asyncio.sleep(0.01)
         await main.procesar_mensaje(m)
     await asyncio.gather(main.procesar_mensaje(m1), despues(m2))
-    assert len(llamadas) == 1 and llamadas[0]["messages"][-1]["content"] == "hola\ncuánto debo?"
+    assert len(llamadas) == 1 and llamadas[0]["messages"][-1]["content"] == "hola\nquiero revisar el monto que tengo que pagar"
     assert [t for _, t, _ in proveedor.enviados] == ["Tiene $230.000 pendiente."]
 
 
@@ -537,3 +537,113 @@ async def test_panel_prueba_de_respaldo(db, proveedor, monkeypatch):
         assert r.json() == {"ok": True, "detalle": "ok"}
         assert (await c.post("/admin/api/respaldo", headers=H)).json()["respaldados"] == 0
         assert (await c.post("/admin/api/respaldo/prueba")).status_code == 401
+
+
+# ── Consulta de deuda y pagos sin IA ─────────────────────────────────────
+
+
+async def test_sin_facturas_pendientes_dice_que_esta_al_dia(db, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    from agent.db import FacturaHuno
+
+    async with async_session() as s:   # Comercial Atacama paga su unica factura pendiente
+        await s.execute(update(FacturaHuno).where(FacturaHuno.folio == "1501").values(pagado=True))
+        await s.commit()
+    sin_ia(monkeypatch)
+    r, _ = await cerebro.responder(TEL_MARIA, "cuánto debo?")
+    assert r == ("Comercial Atacama Ltda está al día: no tiene facturas pendientes. "
+                 "¿Necesita el detalle de sus pagos o tiene algún otro requerimiento?")
+    assert "hoy" not in r
+
+
+async def test_deuda_con_vencidas_y_comprobante_en_espera(db, proveedor, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    await nueva_factura(1, "1390", 99000, emision=date(2026, 8, 1))
+    await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(230000, fecha=hoy_chile()))  # espera banco
+    sin_ia(monkeypatch)
+    r, _ = await cerebro.responder(TEL_MARIA, "tengo facturas pendientes?")
+    assert r.startswith("Comercial Atacama Ltda tiene 2 factura(s) pendiente(s) por un total de $329.000:")
+    assert "- N° 1390 (08/2026): $99.000 · vence el 16-08-2026 · VENCIDA" in r
+    assert "- N° 1501 (10/2026): $230.000 · vence el 16-10-2026" in r
+    assert "bloqueada" in r and "Recibimos su comprobante por $230.000" in r
+
+
+async def test_detalle_de_pagos(db, monkeypatch):
+    await cargar_ejemplos(cartola=False)
+    from agent.db import FacturaHuno
+
+    async with async_session() as s:
+        await s.execute(update(FacturaHuno).where(FacturaHuno.folio == "1450").values(fecha_pago=date(2026, 9, 10)))
+        await s.commit()
+    await nueva_factura(1, "1502b", 100000, abonos=(40000,))
+    sin_ia(monkeypatch)
+    r, _ = await cerebro.responder(TEL_MARIA, "me puede enviar el detalle de mis pagos")
+    assert "Últimos pagos de Comercial Atacama Ltda:" in r
+    assert "- N° 1450 (09/2026): $230.000 · pagada el 10-09-2026" in r
+    assert "- N° 1502b (10/2026): abonado $40.000 de $100.000 (saldo $60.000)" in r
+    # La IA tambien lo tiene como herramienta (p. ej. responde "sí" a "¿necesita el detalle de sus pagos?")
+    t = json.loads(await herramientas.ejecutar("consultar_pagos_realizados", {}, TEL_MARIA))
+    assert t["empresas"][0]["pagos"] == 1
+
+
+async def test_varias_empresas_la_deuda_sigue_preguntando_cual(db, monkeypatch):
+    await cargar_dueno_con_dos_empresas()
+    llamadas = ia_falsa(monkeypatch)
+    await cerebro.responder(TEL_DUENO, "cuánto debo?")
+    assert len(llamadas) == 1   # la IA muestra las opciones (consultar_facturas_pendientes pide elegir)
+    r = await herramientas.consultar_pagos_realizados(TEL_DUENO)
+    assert r["resultado"] == "elegir_empresa"
+
+
+# ── Rapidez ──────────────────────────────────────────────────────────────
+
+
+async def test_pregunta_completa_no_espera_y_saludo_si(db, proveedor, monkeypatch):
+    import time
+
+    ia_falsa(monkeypatch, "ok")
+    monkeypatch.setattr(main, "AGRUPAR_SEGUNDOS", 0.3)
+    main.proveedor = proveedor
+    t0 = time.monotonic()
+    await main.procesar_mensaje(mensaje(TEL_MARIA, "¿hasta qué día puedo pagar la factura de octubre?", evento="q1"))
+    assert time.monotonic() - t0 < 0.25
+    t0 = time.monotonic()
+    await main.procesar_mensaje(mensaje(TEL_MARIA, "hola", evento="q2"))
+    assert time.monotonic() - t0 >= 0.3
+    assert main._parece_incompleto("una consulta") and not main._parece_incompleto("gracias")
+
+
+async def test_indicador_escribiendo(db, proveedor, monkeypatch):
+    import asyncio
+
+    vistos = []
+
+    async def escribiendo(ctx):
+        vistos.append(ctx["conversation_id"])
+    monkeypatch.setattr(proveedor, "indicar_escribiendo", escribiendo)
+    await flujo.procesar(proveedor, mensaje(TEL_MARIA, "hola", evento="t1"))
+    await asyncio.sleep(0)
+    assert vistos == ["conv-" + TEL_MARIA]
+    await memoria.pausar_por_humano("conv-" + TEL_MARIA, TEL_MARIA, 12)   # con un ejecutivo atendiendo, no
+    await flujo.procesar(proveedor, mensaje(TEL_MARIA, "hola", evento="t2"))
+    await asyncio.sleep(0)
+    assert len(vistos) == 1
+
+
+async def test_zernio_indicador_escribiendo(monkeypatch):
+    import httpx
+
+    from agent.providers import zernio
+
+    vistos = []
+
+    def manejar(req):
+        vistos.append(req)
+        return httpx.Response(200, json={"success": True})
+    real = httpx.AsyncClient
+    monkeypatch.setattr(zernio.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(manejar)))
+    p = zernio.ProveedorZernio()
+    p.api_key = "k"
+    await p.indicar_escribiendo({"conversation_id": "c1", "account_id": "a1"})
+    assert str(vistos[0].url) == "https://zernio.com/api/v1/inbox/conversations/c1/typing"
+    assert json.loads(vistos[0].content) == {"accountId": "a1"} and vistos[0].headers["authorization"] == "Bearer k"

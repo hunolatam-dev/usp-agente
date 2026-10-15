@@ -44,3 +44,7 @@ class ProveedorWhatsApp(ABC):
 
     async def verificar_conexion(self) -> tuple[bool, str]:
         return True, "sin chequeo"
+
+    async def indicar_escribiendo(self, contexto: dict) -> None:
+        """Muestra "escribiendo..." al cliente mientras se prepara la respuesta (opcional)."""
+        return None

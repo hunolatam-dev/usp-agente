@@ -9,7 +9,7 @@ import json
 from sqlalchemy import select
 
 from agent import conciliacion, config, escalamientos, huno, memoria
-from agent.db import Comprobante, async_session, hoy_chile
+from agent.db import Comprobante, FacturaHuno, async_session, hoy_chile
 from agent.utils import formatear_monto, formatear_rut, normalizar_rut
 
 DEFINICIONES = [
@@ -27,6 +27,16 @@ DEFINICIONES = [
                     "Usa 'todas' solo si pide explicitamente todas sus empresas.",
                 }
             },
+        },
+    },
+    {
+        "name": "consultar_pagos_realizados",
+        "description": "Ultimas facturas PAGADAS de una empresa del cliente (folio, periodo, monto y fecha de pago) y "
+        "abonos de las pendientes. Usala cuando pida el detalle o historial de sus pagos. Mismas reglas de empresa que "
+        "consultar_facturas_pendientes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"empresa": {"type": "string", "description": "Numero de opcion, RUT o nombre de la empresa"}},
         },
     },
     {
@@ -97,17 +107,18 @@ ETIQUETAS = {
 }
 
 
-async def consultar_facturas_pendientes(telefono: str, empresa: str | None = None) -> dict:
+async def _clientes_para(telefono: str, empresa: str | None) -> tuple[list[huno.Cliente], dict | None]:
+    """Empresas del telefono que se van a mostrar, o la respuesta para la IA si falta algo."""
     clientes = sorted(await huno.clientes_de_telefono(telefono), key=lambda c: c.nombre.lower())
     if not clientes:
         from agent import registro
 
-        return {"resultado": "telefono_no_registrado", "mensaje_para_el_cliente": await registro.invitacion(telefono),
-                "instruccion": "No muestres deudas. Transmite este mensaje tal cual."}
+        return [], {"resultado": "telefono_no_registrado", "mensaje_para_el_cliente": await registro.invitacion(telefono),
+                    "instruccion": "No muestres deudas ni pagos. Transmite este mensaje tal cual."}
     if len(clientes) > 1 and (empresa or "").strip().lower() not in ("todas", "todos", "all"):
         elegido = huno.elegir(empresa, clientes) if empresa else None
         if elegido is None:
-            return {
+            return [], {
                 "resultado": "elegir_empresa",
                 "opciones": huno.lista_opciones(clientes),
                 "instruccion": "Este numero esta asociado a varias empresas. Muestra estas opciones tal cual y "
@@ -115,28 +126,98 @@ async def consultar_facturas_pendientes(telefono: str, empresa: str | None = Non
                 + (" La respuesta anterior no coincidio con ninguna opcion." if empresa else ""),
             }
         clientes = [elegido]
-    empresas = []
+    return clientes, None
+
+
+def _fecha(d) -> str:
+    return d.strftime("%d-%m-%Y") if d else "sin fecha"
+
+
+async def deuda_de(cliente: huno.Cliente, telefono: str | None = None) -> dict:
+    """Facturas pendientes de una empresa y el mensaje listo para el cliente."""
     async with async_session() as s:
-        for c in clientes:
-            facturas = await huno.facturas_pendientes(s, [c.id])
-            empresas.append({
-                "empresa": c.nombre,
-                "rut": formatear_rut(c.rut) if c.rut else None,
-                "total_pendiente": formatear_monto(sum(f.saldo for f in facturas)),
-                "facturas": [
-                    {"folio": f.folio, "saldo": formatear_monto(f.saldo),
-                     "total_factura": formatear_monto(f.monto),
-                     "abonado": formatear_monto(f.abonado) if f.abonado else None,
-                     "periodo": f.periodo, "glosa": f.glosa,
-                     "emision": f.fecha_emision.isoformat() if f.fecha_emision else None,
-                     "vence": f.vence.isoformat() if f.vence else None,
-                     "vencida": bool(f.vence and f.vence < hoy_chile())}
-                    for f in facturas[:15]
-                ],
-            })
+        facturas = await huno.facturas_pendientes(s, [cliente.id])
+        espera = []
+        if telefono:
+            espera = (await s.execute(
+                select(Comprobante).where(Comprobante.telefono == telefono, Comprobante.estado == "pendiente_banco")
+            )).scalars().all()
+    hoy = hoy_chile()
+    if not facturas:
+        mensaje = config.respuesta("al_dia", empresa=cliente.nombre)
+    else:
+        lineas = []
+        for f in facturas[:15]:
+            vencida = bool(f.vence and f.vence < hoy)
+            lineas.append(
+                f"- N° {f.folio}" + (f" ({f.periodo})" if f.periodo else "") + f": {formatear_monto(f.saldo)}"
+                + (f" (abonado {formatear_monto(f.abonado)})" if f.abonado else "")
+                + (f" · vence el {_fecha(f.vence)}" if f.vence else "") + (" · VENCIDA" if vencida else ""))
+        if len(facturas) > 15:
+            lineas.append(f"- y {len(facturas) - 15} más")
+        extras = []
+        if any(f.vence and f.vence < hoy for f in facturas):
+            extras.append(config.respuesta("aviso_vencidas"))
+        for c in espera:
+            extras.append(config.respuesta("aviso_comprobante_en_espera", monto=formatear_monto(c.monto or 0)))
+        mensaje = config.respuesta(
+            "facturas_pendientes", empresa=cliente.nombre, cantidad=len(facturas),
+            total=formatear_monto(sum(f.saldo for f in facturas)), lista="\n".join(lineas),
+            extras=("\n\n" + "\n\n".join(e for e in extras if e)) if any(extras) else "")
+    return {
+        "empresa": cliente.nombre,
+        "rut": formatear_rut(cliente.rut) if cliente.rut else None,
+        "al_dia": not facturas,
+        "total_pendiente": formatear_monto(sum(f.saldo for f in facturas)),
+        "facturas": [
+            {"folio": f.folio, "saldo": formatear_monto(f.saldo), "total_factura": formatear_monto(f.monto),
+             "abonado": formatear_monto(f.abonado) if f.abonado else None, "periodo": f.periodo, "glosa": f.glosa,
+             "emision": f.fecha_emision.isoformat() if f.fecha_emision else None,
+             "vence": f.vence.isoformat() if f.vence else None, "vencida": bool(f.vence and f.vence < hoy)}
+            for f in facturas[:15]
+        ],
+        "mensaje_para_el_cliente": mensaje,
+    }
+
+
+async def consultar_facturas_pendientes(telefono: str, empresa: str | None = None) -> dict:
+    clientes, falta = await _clientes_para(telefono, empresa)
+    if falta:
+        return falta
+    empresas = [await deuda_de(c, telefono) for c in clientes]
     return {"resultado": "ok", "empresas": empresas,
-            "nota": "Datos de Finanzas de HUNO. Pagos de hoy pueden no estar reflejados todavia. "
-                    "Si hay facturas vencidas, recuerda con respeto que el no pago bloquea los servicios contratados."}
+            "instruccion": "Transmite mensaje_para_el_cliente tal cual (si hay varias empresas, uno tras otro). "
+                           "Si una empresa esta al dia, solo di que esta al dia: no menciones pagos de hoy ni "
+                           "comprobantes."}
+
+
+async def pagos_de(cliente: huno.Cliente, limite: int = 6) -> dict:
+    """Ultimas facturas pagadas y abonos de las pendientes, con el mensaje listo para el cliente."""
+    async with async_session() as s:
+        pagadas = (await s.execute(
+            select(FacturaHuno).where(FacturaHuno.cliente_id == cliente.id, FacturaHuno.pagado.is_(True))
+            .order_by(FacturaHuno.fecha_pago.is_(None), FacturaHuno.fecha_pago.desc(), FacturaHuno.id.desc())
+            .limit(limite)
+        )).scalars().all()
+        con_abono = [f for f in await huno.facturas_pendientes(s, [cliente.id]) if f.abonado]
+    lineas = [f"- N° {huno.folio_de(f)}" + (f" ({f.mes:02d}/{f.anio})" if f.mes and f.anio else "")
+              + f": {formatear_monto(f.monto or 0)} · pagada el {_fecha(f.fecha_pago)}" for f in pagadas]
+    lineas += [f"- N° {f.folio}" + (f" ({f.periodo})" if f.periodo else "")
+               + f": abonado {formatear_monto(f.abonado)} de {formatear_monto(f.monto)} (saldo {formatear_monto(f.saldo)})"
+               for f in con_abono]
+    if lineas:
+        mensaje = config.respuesta("pagos_realizados", empresa=cliente.nombre, lista="\n".join(lineas))
+    else:
+        mensaje = config.respuesta("sin_pagos", empresa=cliente.nombre)
+    return {"empresa": cliente.nombre, "pagos": len(pagadas), "abonos": len(con_abono), "mensaje_para_el_cliente": mensaje}
+
+
+async def consultar_pagos_realizados(telefono: str, empresa: str | None = None) -> dict:
+    clientes, falta = await _clientes_para(telefono, empresa)
+    if falta:
+        return falta
+    return {"resultado": "ok", "empresas": [await pagos_de(c) for c in clientes],
+            "instruccion": "Transmite mensaje_para_el_cliente tal cual."}
 
 
 async def estado_comprobantes(telefono: str) -> dict:
@@ -208,6 +289,8 @@ async def ejecutar(nombre: str, entrada: dict, telefono: str) -> str:
     try:
         if nombre == "consultar_facturas_pendientes":
             r = await consultar_facturas_pendientes(telefono, (entrada.get("empresa") or None))
+        elif nombre == "consultar_pagos_realizados":
+            r = await consultar_pagos_realizados(telefono, (entrada.get("empresa") or None))
         elif nombre == "estado_comprobantes":
             r = await estado_comprobantes(telefono)
         elif nombre == "registrar_rut_empresa":

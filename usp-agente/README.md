@@ -11,12 +11,13 @@ Basado en [WhatsApp AgentKit](https://github.com/Hainrixz/whatsapp-agentkit) (MI
 | El cliente… | El agente… |
 |---|---|
 | Saluda, agradece, pide datos de transferencia, horario o servicios, o pide hablar con una persona | Responde con un texto fijo, **sin llamar a la IA** |
-| Pregunta cuánto debe | Muestra sus facturas de Finanzas (app.huno.cl), pero solo si su teléfono está en la ficha del cliente. Si no, le ofrece registrar el número (ver abajo) |
+| Pregunta cuánto debe | Muestra sus facturas de Finanzas (app.huno.cl), pero solo si su teléfono está en la ficha del cliente. Si no debe nada, dice que está **al día** y ofrece el detalle de sus pagos. Con una sola empresa responde sin IA. Si el número no está registrado, le ofrece registrarlo (ver abajo) |
+| Pide el detalle de sus pagos | Últimas facturas pagadas (con fecha de pago) y abonos de las pendientes |
 | Escribe desde un número que no está en ninguna ficha | Le dice que no se pudo validar el número y le ofrece registrarlo con el RUT de la empresa y el correo registrado |
 | Pregunta por planes o precios | Indica los 5 servicios y que los valores comienzan en $55.000 mensuales. Mientras no exista el cotizador (`cotizador_url`), ofrece que un ejecutivo cotice |
 | Envía un comprobante (imagen o PDF) | La IA lee monto, fecha, N° de operación y cuenta de destino. **El código** decide si el pago se confirma |
 | Envía otro documento (factura, contrato, Excel, Word…) | Lo guarda y lo deriva a un ejecutivo: puede ser para contabilidad o RRHH |
-| Escribe varios mensajes seguidos | Espera 4 s y responde una sola vez |
+| Escribe varios mensajes seguidos | Si el primero parece incompleto ("hola"), espera hasta 3 s y responde una sola vez |
 | Escribe mientras atiende un ejecutivo | No responde (sí avisa si se confirma un pago) |
 | Escribe desde el celular de USP o el inbox de Zernio (ejecutivo) | El agente se calla 12 h en ese chat. Las respuestas automáticas de WhatsApp Business (bienvenida/ausencia) **no** lo callan |
 
@@ -62,6 +63,7 @@ Límites por número en 24 h: 3 intentos con RUT/correo que no calzan y 3 envío
 ### 2. Zernio
 1. Crea la cuenta en zernio.com y conecta el número **+56 9 7870 1038 con Coexistence** (escaneando el QR desde WhatsApp Business del celular de USP).
 2. En *Settings → API Keys*, crea una key. Esa key va en `ZERNIO_API_KEY`.
+3. **Abre la app WhatsApp Business del celular de USP al menos una vez cada 14 días.** Meta lo exige para mantener la conexión de Coexistence. El celular no necesita estar encendido para que el agente responda: todo corre en Railway, Supabase y Zernio.
 
 ### 3. Railway
 1. Sube esta carpeta a un repo privado (por ejemplo `hunolatam-dev/usp-agente`).
@@ -92,6 +94,13 @@ En `ejemplos/` hay una cartola de muestra con el formato que reconoce.
 
 Para recibir los casos nuevos en Telegram, configura `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`.
 
+## Rapidez
+- Las respuestas fijas (saludo, datos de transferencia, deuda y pagos con una empresa, registro del número) no usan la IA: salen en 1 a 2 segundos.
+- Mientras prepara la respuesta, el cliente ve "escribiendo..." (y su mensaje queda leído).
+- Solo espera a que el cliente termine de escribir cuando el mensaje parece incompleto ("hola", "una consulta"): hasta 3 s (`AGRUPAR_SEGUNDOS`). Una pregunta completa se responde al tiro.
+- En Railway, el servicio debe estar en la región **US West (California)**, la más cercana a la base de Supabase (us-west-2, Oregon), y sin "Serverless" (que lo apaga cuando no hay mensajes). Cada respuesta hace varias consultas a la base: con regiones lejanas se suman segundos.
+- En los logs de Railway cada mensaje muestra `respondido en X s` y cada llamada a la IA `Claude …: N in / M out … en X s`.
+
 ## Costos
 - **Zernio:** $0 por 1–2 números conectados. Meta cobra los mensajes según su tarifa vigente para Chile.
 - **Claude:** Haiku por defecto. Los saludos y las respuestas de comprobantes son textos fijos y no gastan tokens. El prompt va en caché.
@@ -100,7 +109,7 @@ Para recibir los casos nuevos en Telegram, configura `TELEGRAM_BOT_TOKEN` y `TEL
 ## Desarrollo
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest            # 109 pruebas (SQLite)
+python -m pytest            # 116 pruebas (SQLite)
 TEST_DATABASE_URL=postgresql://... python -m pytest   # contra Postgres
 uvicorn agent.main:app --reload --port 8000
 ```

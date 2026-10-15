@@ -53,6 +53,14 @@ _RE_PERSONA = re.compile(
     r"^(hola )?((quiero|necesito|puedo|podria|me gustaria) )?(hablar|conversar|comunicarme|contactarme|contactar) "
     r"con (una persona|un ejecutivo|una ejecutiva|alguien|un humano|un agente|una persona real)( por favor)?$|"
     r"^(ejecutivo|ejecutiva|persona|humano|una persona|un ejecutivo)( por favor)?$")
+# Consulta de deuda o de pagos de un numero registrado con UNA empresa: respuesta fija con sus datos
+_RE_DEUDA = re.compile(
+    r"\b(cuanto (le )?(debo|debemos|adeudo|adeudamos|tengo pendiente|tenemos pendiente)|que (debo|debemos|facturas tengo|"
+    r"tengo pendiente)|facturas? pendientes?|tengo (alguna )?(deuda|factura|facturas|algo) pendientes?|tengo deudas?|"
+    r"(estoy|estamos) al dia|estado de cuenta|mi deuda|nuestra deuda|mis facturas|saldo pendiente|cual es mi deuda)\b")
+_RE_PAGOS = re.compile(
+    r"\b(detalle de (mis|los|nuestros) pagos|mis pagos|historial de pagos|pagos realizados|que (he|hemos) pagado|"
+    r"ultimos pagos|facturas pagadas)\b")
 # Un numero no registrado que pregunta por su cuenta: se le ofrece registrarlo (sin IA)
 _RE_SU_CUENTA = re.compile(r"\b(debo|debemos|deuda|deudas|adeudo|facturas?|saldo|estado de cuenta|pendientes?|mis pagos|"
                            r"mi cuenta|nuestra cuenta|vencid[ao]s?)\b")
@@ -210,6 +218,11 @@ async def regla_rapida(telefono: str, texto: str) -> str | None:
         if _RE_SERVICIOS.search(t) and not _RE_NO_SERVICIOS.search(t):
             clave = "servicios_cotizador" if str(config.negocio().get("cotizador_url") or "").strip() else "servicios"
             return config.respuesta(clave)
+        if len(empresas) == 1 and (_RE_PAGOS.search(t) or _RE_DEUDA.search(t)):
+            cliente = (await huno.clientes_de_telefono(telefono))[0]
+            if _RE_PAGOS.search(t):
+                return (await herramientas.pagos_de(cliente))["mensaje_para_el_cliente"]
+            return (await herramientas.deuda_de(cliente, telefono))["mensaje_para_el_cliente"]
     if not registrado and registro.es_telefono(telefono) and len(texto) <= 120 and _RE_SU_CUENTA.search(t) \
             and not await _comprobantes_esperando_rut(telefono):
         return await registro.invitacion(telefono)

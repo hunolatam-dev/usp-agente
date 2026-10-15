@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
@@ -34,7 +35,7 @@ logger.setLevel(logging.DEBUG if ENVIRONMENT == "development" else logging.INFO)
 _candados: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # Mensajes de texto seguidos ("hola" / "una consulta" / "cuanto debo") se juntan y se responden
 # una sola vez: menos ruido para el cliente y menos tokens.
-AGRUPAR_SEGUNDOS = float(os.getenv("AGRUPAR_SEGUNDOS", "4"))
+AGRUPAR_SEGUNDOS = float(os.getenv("AGRUPAR_SEGUNDOS", "3"))
 _en_espera: dict[str, list[MensajeEntrante]] = defaultdict(list)
 # Un mensaje saliente que no paso por Zernio (sentVia null) a pocos segundos de uno entrante es
 # la bienvenida / ausencia automatica de WhatsApp Business: NO es un ejecutivo, no pausa.
@@ -185,6 +186,17 @@ async def registrar_saliente(msg: MensajeEntrante):
         await memoria.guardar_mensaje(msg.telefono, "assistant", f"[Respondió un ejecutivo de USP]: {msg.texto.strip()}")
 
 
+def _parece_incompleto(texto: str) -> bool:
+    from agent.cerebro import _AFIRMACIONES, _GRACIAS, _SALUDOS, _limpio
+
+    t = _limpio(texto or "")
+    if t in _SALUDOS:
+        return True
+    if t in _GRACIAS or t in _AFIRMACIONES or "?" in texto or "¿" in texto:
+        return False
+    return len(t.split()) <= 3
+
+
 async def _agrupar(msg: MensajeEntrante) -> MensajeEntrante | None:
     """
     Espera unos segundos por si el cliente sigue escribiendo. Devuelve el mensaje combinado
@@ -194,7 +206,10 @@ async def _agrupar(msg: MensajeEntrante) -> MensajeEntrante | None:
         return msg
     cola = _en_espera[msg.telefono]
     cola.append(msg)
-    await asyncio.sleep(AGRUPAR_SEGUNDOS)
+    # Solo se espera si el mensaje parece la primera parte de algo ("hola", "una consulta"). Una
+    # pregunta completa se responde al tiro (y se lleva consigo el "hola" que estaba esperando).
+    if _parece_incompleto(msg.texto):
+        await asyncio.sleep(AGRUPAR_SEGUNDOS)
     if not cola or cola[-1] is not msg:
         return None
     grupo = list(cola)
@@ -221,6 +236,7 @@ async def procesar_mensaje(msg: MensajeEntrante):
     msg = await _agrupar(msg)
     if msg is None:
         return
+    inicio = time.monotonic()
     evento_id = msg.contexto.get("evento_id") or msg.mensaje_id
     async with _candados[msg.telefono]:
         try:
@@ -247,3 +263,4 @@ async def procesar_mensaje(msg: MensajeEntrante):
             enviados.append(texto)
         if turno and enviados:
             await memoria.guardar_turno(msg.telefono, turno, "\n\n".join(enviados))
+        logger.info(f"{msg.telefono}: respondido en {time.monotonic() - inicio:.1f} s")

@@ -510,7 +510,7 @@ async def test_conversacion_usa_herramienta_de_facturas(db, monkeypatch):
     monkeypatch.setattr(llm, "crear_mensaje", crear_falso)
     from agent import cerebro
 
-    texto, guardar = await cerebro.responder(TEL_MARIA, "cuánto debo?")
+    texto, guardar = await cerebro.responder(TEL_MARIA, "quiero revisar el monto que tengo que pagar")
     assert texto == "Tiene $230.000 pendiente." and guardar
     assert llamadas[0]["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert "NUNCA CONFIRMAS UN PAGO" in llamadas[0]["system"][0]["text"]
@@ -573,7 +573,7 @@ async def test_sdk_real_ciclo_de_herramientas(db, monkeypatch):
     monkeypatch.setattr(llm, "_cliente", _cliente_anthropic_simulado(respuestas, peticiones))
     from agent import cerebro
 
-    texto, _ = await cerebro.responder(TEL_MARIA, "cuánto debo?")
+    texto, _ = await cerebro.responder(TEL_MARIA, "quiero revisar el monto que tengo que pagar")
     assert texto == "Tiene $230.000 pendiente."
     segunda = peticiones[1]
     assert segunda["output_config"] == {"effort": "low"}

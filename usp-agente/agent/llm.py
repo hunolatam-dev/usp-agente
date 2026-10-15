@@ -1,6 +1,7 @@
 # agent/llm.py — Cliente de Claude compartido
 import logging
 import os
+import time
 
 from anthropic import AsyncAnthropic
 
@@ -40,10 +41,11 @@ async def crear_mensaje(**kwargs):
     """messages.create con esfuerzo bajo; si el modelo no lo acepta, reintenta sin el."""
     global _soporta_esfuerzo
     kwargs.setdefault("max_tokens", MAX_TOKENS)
+    inicio = time.monotonic()
     if _soporta_esfuerzo and ESFUERZO:
         try:
             r = await cliente().messages.create(output_config={"effort": ESFUERZO}, **kwargs)
-            _log_uso(kwargs.get("model"), r)
+            _log_uso(kwargs.get("model"), r, inicio)
             return r
         except Exception as e:  # noqa: BLE001
             if not _es_error_de_esfuerzo(e):
@@ -51,14 +53,15 @@ async def crear_mensaje(**kwargs):
             logger.warning("El modelo no acepta output_config.effort; se desactiva")
             _soporta_esfuerzo = False
     r = await cliente().messages.create(**kwargs)
-    _log_uso(kwargs.get("model"), r)
+    _log_uso(kwargs.get("model"), r, inicio)
     return r
 
 
-def _log_uso(modelo, r):
+def _log_uso(modelo, r, inicio=None):
     u = getattr(r, "usage", None)
     if u is not None:
         logger.info(
             f"Claude {modelo}: {u.input_tokens} in / {u.output_tokens} out"
             f" (cache leido {getattr(u, 'cache_read_input_tokens', 0) or 0})"
+            + (f" en {time.monotonic() - inicio:.1f} s" if inicio else "")
         )
