@@ -33,6 +33,7 @@ class DatosComprobante:
     rut_destino: str | None = None
     legible: bool = True
     crudo: str = ""
+    tipo_documento: str | None = None  # si no es comprobante: que parece ser (factura, cartola, foto...)
 
 
 HERRAMIENTA = {
@@ -54,6 +55,12 @@ HERRAMIENTA = {
             "nombre_origen": {"type": ["string", "null"], "description": "Nombre de quien transfiere"},
             "cuenta_destino": {"type": ["string", "null"], "description": "Numero de cuenta destino (aunque este parcialmente oculto)"},
             "rut_destino": {"type": ["string", "null"], "description": "RUT del destinatario"},
+            "tipo_documento": {
+                "type": ["string", "null"],
+                "description": "Si NO es un comprobante de transferencia realizada: que es, en pocas palabras "
+                "(ej: 'factura', 'cartola bancaria', 'liquidacion de sueldo', 'contrato', 'transferencia programada', "
+                "'captura de pantalla', 'foto'). null si es comprobante.",
+            },
         },
         "required": ["es_comprobante", "legible"],
     },
@@ -81,7 +88,7 @@ def _bloque_archivo(contenido: bytes, mime: str) -> dict | None:
 
 def detectar_mime(contenido: bytes, mime: str | None) -> str:
     """El content-type de la descarga a veces viene generico: se mira la firma del archivo."""
-    if contenido.startswith(b"%PDF"):
+    if b"%PDF-" in contenido[:1024]:  # algunos PDF traen bytes basura antes de la firma
         return MIME_PDF
     if contenido.startswith(b"\x89PNG"):
         return "image/png"
@@ -118,6 +125,7 @@ def interpretar(entrada: dict) -> DatosComprobante:
         cuenta_destino=(entrada.get("cuenta_destino") or None),
         rut_destino=normalizar_rut(entrada.get("rut_destino")),
         crudo=json.dumps(entrada, ensure_ascii=False)[:4000],
+        tipo_documento=(str(entrada.get("tipo_documento") or "").strip()[:80] or None),
     )
 
 

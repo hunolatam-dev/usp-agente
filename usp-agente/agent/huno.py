@@ -19,7 +19,7 @@ from datetime import date
 
 from sqlalchemy import func, or_, select, update
 
-from agent.db import AbonoHuno, ClienteHuno, FacturaHuno, ahora, async_session
+from agent.db import AbonoHuno, ClienteHuno, FacturaHuno, ahora, async_session, engine
 from agent.utils import normalizar_rut, normalizar_telefono
 
 logger = logging.getLogger("usp")
@@ -294,3 +294,60 @@ async def factura(s, factura_id: int) -> FacturaHuno | None:
 
 def folio_de(f: FacturaHuno | None) -> str | None:
     return _folio(f) if f is not None else None
+
+
+# ── Registro de un telefono por WhatsApp ─────────────────────────────────
+
+_RE_CORREO = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _lista_json(texto) -> list | None:
+    """clientes.telefonos / clientes.correos: app.huno.cl guarda JSON.stringify([{valor, label}])."""
+    if texto is None or str(texto).strip() == "":
+        return []
+    try:
+        datos = json.loads(texto)
+        if isinstance(datos, str):
+            datos = json.loads(datos)
+    except (ValueError, TypeError):
+        return None
+    return datos if isinstance(datos, list) else None
+
+
+async def correos_de(cliente_id: int) -> set[str]:
+    """Correos registrados del cliente (clientes.correos y, si existe, clientes.portal_email), en minusculas."""
+    async with async_session() as s:
+        fila = await s.get(ClienteHuno, cliente_id)
+        texto = fila.correos if fila else None
+        portal = None
+        if engine.dialect.name == "postgresql":
+            from sqlalchemy import text as sql
+
+            portal = (await s.execute(sql("select to_jsonb(c)->>'portal_email' from public.clientes c where c.id = :i"),
+                                      {"i": cliente_id})).scalar()
+    salida = {m.group(0).lower() for m in _RE_CORREO.finditer(str(texto or ""))}
+    if portal:
+        salida |= {m.group(0).lower() for m in _RE_CORREO.finditer(portal)}
+    return salida
+
+
+async def agregar_telefono(cliente_id: int, telefono: str, nombre: str) -> bool:
+    """
+    Agrega el numero a clientes.telefonos con el mismo formato que usa app.huno.cl
+    ([{"valor": "+569...", "label": "Nombre"}]). Devuelve False si ya estaba.
+    """
+    async with async_session() as s:
+        fila = (await s.execute(select(ClienteHuno).where(ClienteHuno.id == cliente_id).with_for_update())).scalars().first()
+        if fila is None:
+            raise ValueError(f"Cliente {cliente_id} no existe")
+        if telefono in [t for t, _ in parsear_telefonos(fila.telefonos)]:
+            return False
+        lista = _lista_json(fila.telefonos)
+        if lista is None:
+            # Texto antiguo que no es JSON: se pasa al formato de la app sin perder los numeros
+            lista = [{"valor": "+" + t, "label": n or ""} for t, n in parsear_telefonos(fila.telefonos)]
+        lista.append({"valor": "+" + telefono, "label": nombre})
+        fila.telefonos = json.dumps(lista, ensure_ascii=False)
+        await s.commit()
+    invalidar_cache()
+    return True

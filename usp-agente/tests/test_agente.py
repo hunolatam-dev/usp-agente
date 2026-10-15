@@ -247,7 +247,8 @@ async def test_rut_declarado_no_permite_ver_deuda(db):
 
     await memoria.guardar_rut_declarado(TEL_DESCONOCIDO, "76123456-0")
     r = await herramientas.consultar_facturas_pendientes(TEL_DESCONOCIDO)
-    assert r == {"resultado": "telefono_no_registrado"}
+    assert r["resultado"] == "telefono_no_registrado" and "empresas" not in r
+    assert "RUT de la empresa" in r["mensaje_para_el_cliente"]  # se le ofrece registrar el numero
     r = await herramientas.consultar_facturas_pendientes(TEL_MARIA)
     assert r["empresas"][0]["total_pendiente"] == "$230.000"
 
@@ -274,8 +275,10 @@ async def test_sin_factura_exacta_se_escala(db, proveedor, monkeypatch):
 async def test_no_es_comprobante(db, proveedor, monkeypatch):
     await cargar_ejemplos()
     resp = await enviar_comprobante(proveedor, monkeypatch, TEL_MARIA, datos(None, es=False))
-    assert "no parece un comprobante" in resp[0]
-    assert await contar(Escalamiento) == 0
+    assert "no parece un comprobante" in resp[0] and "ejecutivo" in resp[0]
+    # Puede ser un documento para otra area: queda guardado y lo ve una persona
+    assert await contar(Escalamiento, Escalamiento.motivo == "documento_recibido") == 1
+    assert await contar(Pago) == 0
 
 
 async def test_dos_facturas_mismo_monto_paga_la_mas_antigua(db, proveedor, monkeypatch):
@@ -330,6 +333,7 @@ async def _cliente(proveedor):
     main.proveedor = proveedor
     main.app.state.proveedor = proveedor
     main.error_configuracion = None
+    main.estado_db.update(ok=True, detalle="conectada")
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
 
 
@@ -358,7 +362,7 @@ async def test_webhook_comprobante_de_punta_a_punta(db, proveedor, monkeypatch):
         r = await c.post("/webhook", content=json.dumps(_payload_recibido(texto="", adjuntos=adj, evento="evt_c")))
         assert r.json()["encolados"] == 1
     assert "Pago confirmado" in proveedor.enviados[-1][1]
-    assert (await memoria.obtener_historial(TEL_MARIA))[0]["content"].startswith("[Envio un archivo")
+    assert (await memoria.obtener_historial(TEL_MARIA))[0]["content"] == "[Envió un comprobante (PDF) por $230.000: confirmado]"
 
 
 async def test_ejecutivo_responde_desde_celular_pausa_agente(db, proveedor):
@@ -451,6 +455,9 @@ async def test_panel_cartola_confirma_y_avisa(db, proveedor, monkeypatch):
 
 
 async def test_panel_confirmacion_manual_pago_de_dos_facturas(db, proveedor, monkeypatch):
+    # Con la regla de varias facturas apagada, un pago de dos facturas lo aplica una persona
+    from agent import config
+    monkeypatch.setitem(config.negocio().setdefault("reglas", {}), "pago_varias_facturas", False)
     await cargar_ejemplos(cartola=False)
     await nueva_factura(1, "1601", 100000)
     await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSF;330.000\n", "c.csv")
@@ -622,8 +629,15 @@ async def test_reenvio_de_comprobante_escalado_no_se_redecide(db, proveedor, mon
 async def test_adjunto_no_soportado_y_audio(db, proveedor):
     proveedor.archivos["u"] = (b"PK\x03\x04zip", "application/zip")
     r, _ = await flujo.procesar(proveedor, MensajeEntrante(
-        telefono=TEL_MARIA, texto="", mensaje_id="x", adjuntos=[Adjunto(tipo="file", url="u")], contexto={}))
-    assert "imagen" in r[0]
+        telefono=TEL_MARIA, texto="planilla de sueldos", mensaje_id="x", adjuntos=[Adjunto(tipo="file", url="u")],
+        contexto={}))
+    # Un Word/Excel/ZIP puede ser para contabilidad o RRHH: se guarda y se deriva, no queda sin respuesta
+    assert "ejecutivo" in r[0] and "captura o PDF" in r[0]
+    async with async_session() as s:
+        esc = (await s.execute(select(Escalamiento))).scalars().one()
+        comp = await s.get(Comprobante, esc.comprobante_id)
+    assert esc.motivo == "documento_recibido" and "planilla de sueldos" in esc.resumen
+    assert comp.archivo == b"PK\x03\x04zip"
     r, _ = await flujo.procesar(proveedor, MensajeEntrante(
         telefono=TEL_MARIA, texto="", mensaje_id="y", adjuntos=[Adjunto(tipo="audio", url="a")], contexto={}))
     assert "audios" in r[0]
@@ -673,7 +687,7 @@ async def test_ia_sabe_quien_escribe(db, monkeypatch):
     from agent import cerebro
 
     await cerebro.responder(TEL_JUAN, "necesito ayuda con mi cuenta")
-    await cerebro.responder(TEL_DESCONOCIDO, "necesito ayuda con mi cuenta")
+    await cerebro.responder(TEL_DESCONOCIDO, "necesito ayuda con un tema")
     assert "Juan Soto" in capturas[0][1]["text"] and "Inversiones Elqui SpA" in capturas[0][1]["text"]
     assert "NO esta registrado" in capturas[1][1]["text"]
 
@@ -743,3 +757,16 @@ async def test_si_solo_una_empresa_calza_no_pregunta(db, proveedor, monkeypatch)
     await importadores.importar_cartola(b"Fecha;Descripcion;Abonos\n10/10/2026;TRANSF;99.000\n", "c.csv")
     resp = await enviar_comprobante(proveedor, monkeypatch, TEL_DUENO, datos(99000))
     assert "Pago confirmado" in resp[0] and "5003" in resp[0]
+
+
+async def test_si_la_base_falla_no_se_cae_el_servidor(db, proveedor, monkeypatch):
+    async def falla():
+        raise RuntimeError("(ECIRCUITBREAKER) too many authentication failures")
+    monkeypatch.setattr(main, "inicializar_db", falla)
+    async with await _cliente(proveedor) as c:
+        assert await main.conectar_db() is False
+        salud = (await c.get("/")).json()
+        assert salud["status"] == "error" and "DATABASE_URL" in salud["base_de_datos"]
+        assert (await c.post("/webhook", content=json.dumps(_payload_recibido()))).status_code == 503
+    monkeypatch.undo()
+    assert await main.conectar_db() is True

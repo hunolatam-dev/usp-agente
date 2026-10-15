@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from agent import avisos, conciliacion, huno, importadores, memoria
+from agent import avisos, conciliacion, huno, importadores, memoria, respaldo, tareas
 from agent.db import (
     Comprobante,
     Conversacion,
@@ -76,6 +76,25 @@ async def subir_cartola(request: Request, archivo: UploadFile = File(...)):
     return {"importacion": res.dict(), "comprobantes_reevaluados": conteo, "avisos": aviso}
 
 
+@router.post("/admin/api/revisar", dependencies=[Depends(autorizar)])
+async def revisar_ahora(request: Request):
+    """Corre ahora la revision que el agente hace cada 30 minutos."""
+    return await tareas.revisar(request.app.state.proveedor)
+
+
+@router.post("/admin/api/respaldo", dependencies=[Depends(autorizar)])
+async def respaldo_ahora():
+    """Respalda por correo los archivos que cumplieron 170 dias y borra los de 180 ya respaldados."""
+    return await respaldo.respaldar_y_limpiar()
+
+
+@router.post("/admin/api/respaldo/prueba", dependencies=[Depends(autorizar)])
+async def respaldo_prueba():
+    """Envia un correo de prueba a alertas@huno.cl para revisar la configuracion."""
+    ok, detalle = await respaldo.correo_de_prueba()
+    return {"ok": ok, "detalle": detalle}
+
+
 # ── Consultas ────────────────────────────────────────────────────────────
 
 
@@ -90,6 +109,7 @@ async def resumen():
             "casos_abiertos": await contar(Escalamiento, Escalamiento.estado == "abierto"),
             "pendientes_banco": await contar(Comprobante, Comprobante.estado == "pendiente_banco"),
             "esperando_rut": await contar(Comprobante, Comprobante.estado == "esperando_rut"),
+            "esperando_empresa": await contar(Comprobante, Comprobante.estado == "esperando_empresa"),
             "confirmados_24h": await contar(Comprobante, Comprobante.estado == "confirmado", Comprobante.actualizado_en >= hace_un_dia),
             "confirmados_sin_avisar": await contar(Comprobante, Comprobante.estado == "confirmado", Comprobante.notificado.is_(False)),
             "facturas_pendientes": await contar(FacturaHuno, or_(FacturaHuno.pagado.is_(None), FacturaHuno.pagado.is_(False))),
@@ -253,6 +273,8 @@ async def confirmar_manual(cid: int, datos: ConfirmacionManual, request: Request
         folio = huno.folio_de(f)
         cliente = await huno.cliente_por_id(f.cliente_id) if f.cliente_id else None
     aviso = {"avisados": 0, "sin_avisar": 0}
+    if not datos.avisar_cliente:
+        await conciliacion.marcar_notificado(cid)  # el ejecutivo decidio no avisar: no queda como pendiente
     if datos.avisar_cliente:
         r = conciliacion.Resultado("confirmado" if nuevo_saldo == 0 else "abono", "", aplicar, folio,
                                    cliente.nombre if cliente else None, cliente.rut if cliente else None, saldo=nuevo_saldo)

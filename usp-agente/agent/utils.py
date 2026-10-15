@@ -123,3 +123,16 @@ def sin_tildes(texto: str) -> str:
 
 def solo_alfanumerico(texto: str | None) -> str:
     return re.sub(r"[^0-9a-z]", "", sin_tildes(texto or ""))
+
+
+_RE_RUT_SUELTO = re.compile(r"^(?:rut\s*:?\s*)?(\d{1,2}[.\s]?\d{3}[.\s]?\d{3}\s*-?\s*[\dkK])\s*\.?$", re.I)
+
+
+def rut_en_mensaje(texto: str | None) -> list[str]:
+    """RUT con guion en cualquier parte del texto, o un mensaje que es solo un RUT sin guion ('761234560')."""
+    ruts = buscar_ruts(texto)
+    if ruts or not texto:
+        return ruts
+    m = _RE_RUT_SUELTO.match(texto.strip())
+    rut = normalizar_rut(m.group(1)) if m else None
+    return [rut] if rut else []

@@ -21,7 +21,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
 load_dotenv()
 
-from agent import admin, config, flujo, memoria  # noqa: E402
+from agent import admin, config, escalamientos, flujo, memoria, tareas  # noqa: E402
 from agent.db import inicializar_db  # noqa: E402
 from agent.providers import obtener_proveedor  # noqa: E402
 from agent.providers.base import MensajeEntrante  # noqa: E402
@@ -32,6 +32,15 @@ logger = logging.getLogger("usp")
 logger.setLevel(logging.DEBUG if ENVIRONMENT == "development" else logging.INFO)
 
 _candados: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Mensajes de texto seguidos ("hola" / "una consulta" / "cuanto debo") se juntan y se responden
+# una sola vez: menos ruido para el cliente y menos tokens.
+AGRUPAR_SEGUNDOS = float(os.getenv("AGRUPAR_SEGUNDOS", "4"))
+_en_espera: dict[str, list[MensajeEntrante]] = defaultdict(list)
+# Un mensaje saliente que no paso por Zernio (sentVia null) a pocos segundos de uno entrante es
+# la bienvenida / ausencia automatica de WhatsApp Business: NO es un ejecutivo, no pausa.
+SEGUNDOS_RESPUESTA_AUTOMATICA = float(os.getenv("SEGUNDOS_RESPUESTA_AUTOMATICA", "15"))
+ESPERA_CLASIFICAR_SALIENTE = float(os.getenv("ESPERA_CLASIFICAR_SALIENTE", "5"))
+REINTENTOS_ENVIO = (1, 3)  # segundos entre reintentos si Zernio falla al enviar
 
 proveedor = None
 error_configuracion: str | None = None
@@ -40,13 +49,54 @@ try:
 except Exception as e:  # noqa: BLE001
     error_configuracion = str(e)
 estado_proveedor = {"ok": None, "detalle": "sin verificar"}
+# Si la base falla al arrancar NO se reinicia el contenedor en bucle: con una clave mala, cada
+# reinicio es un intento fallido y Supabase bloquea la conexion (ECIRCUITBREAKER). Se reintenta
+# con calma cada REINTENTO_DB segundos y mientras tanto el servicio responde "error" en /.
+estado_db = {"ok": False, "detalle": "sin conectar"}
+REINTENTO_DB = 300
+
+
+async def conectar_db() -> bool:
+    try:
+        await inicializar_db()
+        await memoria.limpiar_eventos_viejos()
+    except Exception as e:  # noqa: BLE001
+        texto = str(e).splitlines()[0][:300]
+        if "password authentication failed" in texto or "ECIRCUITBREAKER" in texto:
+            texto += " -> revisa la contrasena en DATABASE_URL (Railway -> Variables)"
+        estado_db.update(ok=False, detalle=texto)
+        logger.error(f"No se pudo conectar a la base de datos: {texto}")
+        return False
+    estado_db.update(ok=True, detalle="conectada")
+    logger.info("Base de datos conectada")
+    return True
+
+
+async def reintentar_db():
+    while not await conectar_db():
+        await asyncio.sleep(REINTENTO_DB)
+    _iniciar_revision()
+
+
+_tarea_revision: asyncio.Task | None = None
+
+
+def _iniciar_revision():
+    global _tarea_revision
+    if proveedor is not None and (_tarea_revision is None or _tarea_revision.done()) \
+            and os.getenv("REVISION_PERIODICA", "1") != "0":
+        _tarea_revision = asyncio.create_task(tareas.ciclo(proveedor))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global estado_proveedor
-    await inicializar_db()
-    await memoria.limpiar_eventos_viejos()
+    tarea_db = None
+    if not await conectar_db():
+        tarea_db = asyncio.create_task(asyncio.sleep(REINTENTO_DB))
+        tarea_db.add_done_callback(lambda _: asyncio.ensure_future(reintentar_db()))
+    else:
+        _iniciar_revision()
     app.state.proveedor = proveedor
     if proveedor:
         ok, detalle = await proveedor.verificar_conexion()
@@ -55,6 +105,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.error(f"Proveedor no configurado: {error_configuracion}")
     yield
+    if tarea_db:
+        tarea_db.cancel()
+    if _tarea_revision:
+        _tarea_revision.cancel()
 
 
 app = FastAPI(title="Agente USP — HUNO®", version="1.0.0", lifespan=lifespan,
@@ -66,15 +120,19 @@ app.include_router(admin.router)
 async def salud():
     if error_configuracion:
         return {"status": "error", "detalle": error_configuracion}
+    if not estado_db["ok"]:
+        return {"status": "error", "base_de_datos": estado_db["detalle"]}
     return {"status": "ok" if estado_proveedor["ok"] else "degradado", "servicio": "agente-usp",
             "conexion": estado_proveedor}
 
 
 @app.post("/webhook")
-async def webhook(request: Request, tareas: BackgroundTasks):
+async def webhook(request: Request, tareas_fondo: BackgroundTasks):
     """Responde 200 de inmediato; Zernio reintenta si no recibe 2xx en 5 segundos."""
     if proveedor is None:
         raise HTTPException(503, error_configuracion or "Proveedor no configurado")
+    if not estado_db["ok"]:
+        raise HTTPException(503, "Base de datos no disponible")  # Zernio reintenta mas tarde
     cuerpo = await request.body()
     if not await proveedor.verificar_firma(request, cuerpo):
         raise HTTPException(401, "Firma invalida")
@@ -89,36 +147,103 @@ async def webhook(request: Request, tareas: BackgroundTasks):
         evento_id = msg.contexto.get("evento_id") or msg.mensaje_id
         if msg.tipo == "saliente_api":
             continue
-        if msg.tipo == "saliente_humano":
+        if msg.tipo in ("saliente_humano", "saliente_desconocido"):
             if await memoria.marcar_evento(evento_id):
-                horas = int(config.reglas()["pausa_humano_horas"])
-                if await memoria.pausar_por_humano(msg.contexto.get("conversation_id"), msg.telefono, horas):
-                    logger.info(f"Un ejecutivo respondio en {msg.contexto.get('conversation_id')}: agente en pausa {horas} h")
+                tareas_fondo.add_task(registrar_saliente, msg)
             continue
         if not msg.telefono or (not msg.texto.strip() and not msg.adjuntos):
-            continue
+            continue  # reacciones, ubicaciones, etc.: no necesitan respuesta
         if not await memoria.marcar_evento(evento_id):
             logger.info(f"Evento repetido: {evento_id}")
             continue
-        tareas.add_task(procesar_mensaje, msg)
+        # Se anota la hora de llegada al tiro (sirve para reconocer respuestas automaticas)
+        try:
+            await memoria.registrar_entrante(msg.telefono, msg.contexto, msg.nombre)
+        except Exception:  # noqa: BLE001 — el evento ya quedo marcado: no perder el mensaje
+            logger.exception("No se pudo registrar la llegada del mensaje")
+        tareas_fondo.add_task(procesar_mensaje, msg)
         encolados += 1
     return {"status": "ok", "encolados": encolados}
 
 
+async def registrar_saliente(msg: MensajeEntrante):
+    """Un mensaje que salio del numero sin pasar por este agente."""
+    conv_id = msg.contexto.get("conversation_id")
+    if msg.tipo == "saliente_desconocido":
+        # Puede ser un ejecutivo en la app del celular o la respuesta automatica de WhatsApp Business:
+        # se espera un poco por si el mensaje del cliente que la provoco llega despues.
+        await asyncio.sleep(ESPERA_CLASIFICAR_SALIENTE)
+        segundos = await memoria.segundos_desde_entrante(msg.telefono, conv_id)
+        if segundos is not None and segundos <= SEGUNDOS_RESPUESTA_AUTOMATICA + ESPERA_CLASIFICAR_SALIENTE:
+            logger.info(f"{msg.telefono}: respuesta automatica de WhatsApp Business, no pausa al agente")
+            return
+    horas = int(config.reglas()["pausa_humano_horas"])
+    if await memoria.pausar_por_humano(conv_id, msg.telefono, horas):
+        logger.info(f"Un ejecutivo respondio en {conv_id}: agente en pausa {horas} h")
+    if msg.texto.strip() and msg.telefono:
+        # Queda en el historial para que, al volver, el agente sepa lo que se converso
+        await memoria.guardar_mensaje(msg.telefono, "assistant", f"[Respondió un ejecutivo de USP]: {msg.texto.strip()}")
+
+
+async def _agrupar(msg: MensajeEntrante) -> MensajeEntrante | None:
+    """
+    Espera unos segundos por si el cliente sigue escribiendo. Devuelve el mensaje combinado
+    o None si un mensaje posterior se encarga de responder.
+    """
+    if msg.adjuntos or AGRUPAR_SEGUNDOS <= 0:
+        return msg
+    cola = _en_espera[msg.telefono]
+    cola.append(msg)
+    await asyncio.sleep(AGRUPAR_SEGUNDOS)
+    if not cola or cola[-1] is not msg:
+        return None
+    grupo = list(cola)
+    cola.clear()
+    if len(grupo) == 1:
+        return msg
+    return MensajeEntrante(telefono=msg.telefono, texto="\n".join(m.texto.strip() for m in grupo if m.texto.strip()),
+                           mensaje_id=msg.mensaje_id, tipo=msg.tipo, nombre=msg.nombre, adjuntos=[],
+                           contexto=msg.contexto)
+
+
+async def _enviar(msg: MensajeEntrante, texto: str, clave: str) -> bool:
+    ctx = dict(msg.contexto, idempotencia=clave)
+    for espera in (0, *REINTENTOS_ENVIO):
+        if espera:
+            await asyncio.sleep(espera)
+        if await proveedor.enviar_mensaje(msg.telefono, texto, ctx):
+            return True
+    logger.error(f"No se pudo responder a {msg.telefono}")
+    return False
+
+
 async def procesar_mensaje(msg: MensajeEntrante):
+    msg = await _agrupar(msg)
+    if msg is None:
+        return
     evento_id = msg.contexto.get("evento_id") or msg.mensaje_id
     async with _candados[msg.telefono]:
         try:
             respuestas, turno = await flujo.procesar(proveedor, msg)
-            for i, texto in enumerate(respuestas):
-                ctx = dict(msg.contexto, idempotencia=f"{evento_id}-{i}")
-                if not await proveedor.enviar_mensaje(msg.telefono, texto, ctx):
-                    logger.error(f"No se pudo responder a {msg.telefono}")
-                    if i == 0:
-                        await memoria.liberar_evento(evento_id)  # que el reintento de Zernio se procese
-                    return
-            if turno and respuestas:
-                await memoria.guardar_turno(msg.telefono, turno, "\n\n".join(respuestas))
         except Exception:  # noqa: BLE001
+            # Nunca dejar al cliente sin respuesta: se le avisa y el caso queda para una persona
             logger.exception(f"Error procesando mensaje de {msg.telefono}")
-            await memoria.liberar_evento(evento_id)
+            try:
+                await escalamientos.crear(msg.telefono, "error_tecnico",
+                                          f"Falla técnica procesando: {(msg.texto or '[archivo]')[:500]}")
+            except Exception:  # noqa: BLE001
+                logger.exception("Tampoco se pudo crear el caso")
+            await _enviar(msg, config.respuesta("error"), f"{evento_id}-error")
+            return
+        enviados = []
+        for i, texto in enumerate(respuestas):
+            if not (texto or "").strip():
+                continue
+            if not await _enviar(msg, texto, f"{evento_id}-{i}"):
+                # WhatsApp/Zernio no acepto el envio: que lo vea una persona
+                await escalamientos.crear(msg.telefono, "error_tecnico",
+                                          "No se pudo enviar la respuesta por WhatsApp. Respuesta pendiente: " + texto[:800])
+                break
+            enviados.append(texto)
+        if turno and enviados:
+            await memoria.guardar_turno(msg.telefono, turno, "\n\n".join(enviados))

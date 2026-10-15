@@ -6,8 +6,14 @@ WebhookPayloadMessageSent) y de https://docs.zernio.com/platforms/whatsapp
 - message.received: lo que escribe el cliente. Los adjuntos de WhatsApp traen una url a
   GET /v1/whatsapp/media/{mediaId} que exige "Authorization: Bearer <API key>" y que
   Meta borra despues de un tiempo: hay que descargarlos apenas llega el webhook.
-- message.sent: mensajes que salen del numero. sentVia == "api" son los de este agente;
-  cualquier otro (la app del celular, el inbox de Zernio) es un ejecutivo de USP.
+- message.sent: mensajes que salen del numero. Segun sentVia:
+    "human"                     -> un ejecutivo en el inbox de Zernio: el agente se pausa.
+    "api", "bulk-api", "broadcast", "sequence", "workflow", "comment_automation"
+                                -> automaticos (este agente u otra automatizacion): no pausan.
+    null                        -> no paso por Zernio: lo escribio alguien en la app WhatsApp
+                                   Business del celular (Coexistence) O es una respuesta automatica
+                                   de Meta (bienvenida / ausencia). main.py distingue por tiempo.
+  message.source == "meta_business_agent" (respondio la IA de Meta) tampoco pausa.
 """
 
 import hashlib
@@ -24,6 +30,7 @@ from agent.providers.base import Adjunto, MensajeEntrante, ProveedorWhatsApp
 logger = logging.getLogger("usp")
 
 BASE_URL_POR_DEFECTO = "https://zernio.com/api/v1"
+VIA_AUTOMATICA = {"api", "bulk-api", "broadcast", "sequence", "workflow", "comment_automation"}
 TAMANO_MAXIMO = 15 * 1024 * 1024
 
 
@@ -84,7 +91,13 @@ class ProveedorZernio(ProveedorWhatsApp):
 
         if evento == "message.sent":
             via = m.get("sentVia")
-            tipo = "saliente_api" if via in ("api", "bulk-api") else "saliente_humano"
+            if via in VIA_AUTOMATICA or m.get("source") == "meta_business_agent":
+                tipo = "saliente_api"
+            elif via == "human":
+                tipo = "saliente_humano"
+            else:
+                tipo = "saliente_desconocido"
+            contexto["sent_via"] = via
             # El telefono del cliente en un mensaje saliente es el participante de la conversacion
             telefono = (conversacion.get("participantId") or "").lstrip("+")
             return [
@@ -98,6 +111,10 @@ class ProveedorZernio(ProveedorWhatsApp):
             ]
 
         if m.get("direction") != "incoming":
+            return []
+        if (cuerpo.get("metadata") or {}).get("standby"):
+            # Otra app (p. ej. la IA de Meta) es duena de la conversacion: no responder encima
+            logger.info("Mensaje en standby (otra app atiende la conversacion): se ignora")
             return []
 
         remitente = m.get("sender") or {}

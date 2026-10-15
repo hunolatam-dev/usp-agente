@@ -7,6 +7,9 @@ negocio:
   whatsapp: "+56 9 7870 1038"
   horario: "lunes a jueves de 9:00 a 18:00 hrs y viernes de 9:00 a 17:30 hrs (sábados, domingos y festivos cerrado)"
   correo_cobranza: "pagos@huno.cl"
+  sitio: "huno.cl"
+  portal_clientes: "clientes.huno.cl"
+  constitucion_url: "huno.cl/constituir"
   sucursales:
     - "Copiapó: Los Carrera #401"
     - "La Serena: Cristóbal Colón #352"
@@ -14,6 +17,21 @@ negocio:
 agente:
   nombre: "Asistente USP de HUNO®"
   tono: "profesional, cercano y breve"
+
+# Servicios que HUNO® ofrece hoy. Lo que no esté aquí NO es un servicio de HUNO®
+# (por ejemplo, soporte informático o reparación de computadores).
+servicios:
+  - "Contabilidad"
+  - "Gestión de RRHH (remuneraciones, contratos y finiquitos)"
+  - "Administración de empresas"
+  - "Marketing digital"
+  - "Sistemas y desarrollo web (sitios, apps y software a medida)"
+
+# Precio de referencia: "los valores comienzan en ..." (CLP mensual)
+precio_desde: 55000
+# Sitio para cotizar el plan (el cliente indica qué necesita y recibe el valor mensual por correo).
+# Mientras esté vacío, el agente deriva la cotización a un ejecutivo.
+cotizador_url: ""
 
 # Datos para transferir. Se le entregan al cliente tal cual.
 datos_transferencia:
@@ -33,6 +51,43 @@ cuentas_destino:
 # Plazo de pago: días corridos desde la emisión de la factura
 plazo_pago_dias: 15
 
+# Horario de atención de los ejecutivos (hora de Chile). Con esto el agente le dice al
+# cliente CUÁNDO le van a responder ("hoy", "mañana a partir de las 9:00", "el lunes...").
+# Los días que no aparecen están cerrados.
+atencion:
+  lunes: "09:00-18:00"
+  martes: "09:00-18:00"
+  miercoles: "09:00-18:00"
+  jueves: "09:00-18:00"
+  viernes: "09:00-17:30"
+  # Feriados en día hábil (AAAA-MM-DD). Agregar los del año siguiente cada diciembre.
+  feriados:
+    - "2026-12-08"
+    - "2026-12-25"
+    - "2027-01-01"
+    - "2027-03-26"
+    - "2027-05-21"
+    - "2027-06-28"
+    - "2027-07-16"
+    - "2027-10-11"
+    - "2027-11-01"
+    - "2027-12-08"
+
+# Registro del número por WhatsApp: el código es el mismo del "Estado de cuenta" de huno.cl
+# (Edge Function send-otp de Supabase, que lo envía al correo registrado de la empresa).
+# La llave es la pública (anon) que ya usan huno.cl y app.huno.cl; no es un secreto.
+registro_whatsapp:
+  otp_url: "https://iysjuwmjytqjvedxnsuf.supabase.co/functions/v1/send-otp"
+  supabase_anon_key: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5c2p1d21qeXRxanZlZHhuc3VmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNzUzNDQsImV4cCI6MjA4ODc1MTM0NH0.gojA_q2zkHJQqSloCO8XXflcEnq09ahoppXADpIZ-QY"
+
+# Archivos que llegan por WhatsApp (comprobantes, documentos): se conservan N días desde que
+# llegan. Unos días antes se envían por correo como respaldo; nunca se borra uno sin respaldo.
+# El correo lo envía huno.cl/api/usp_respaldo.php (solo puede enviar a esa dirección).
+archivos:
+  dias_conservacion: 180
+  dias_respaldo: 170
+  correo_respaldo: "alertas@huno.cl"
+
 # Reglas de confirmación automática
 reglas:
   # Días que puede tardar en aparecer en la cartola un pago respecto de la fecha del comprobante
@@ -42,5 +97,12 @@ reglas:
   dias_espera_banco: 3
   # Sobre este monto (CLP) nunca se confirma solo; lo revisa una persona
   monto_maximo_auto: 3000000
+  # Un pago igual a la suma exacta de las facturas pendientes MÁS ANTIGUAS de una empresa
+  # se confirma solo (todas esas facturas quedan pagadas). false = siempre lo ve una persona.
+  pago_varias_facturas: true
   # Horas que el agente se queda callado cuando un ejecutivo responde desde el celular
   pausa_humano_horas: 12
+  # Si el cliente no responde (RUT o empresa de un comprobante) en estas horas, se deriva
+  horas_sin_respuesta: 6
+  # Máximo de consultas a la IA por número en una hora (protege el costo ante abusos)
+  max_consultas_ia_hora: 30

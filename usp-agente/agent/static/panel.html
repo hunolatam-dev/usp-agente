@@ -96,6 +96,10 @@
     <p class="ayuda">Descarga la cartola desde BCI Pyme (Excel o CSV) y súbela aquí. Solo se guardan los abonos. Subir la misma cartola dos veces no duplica movimientos. Al cargarla, el agente vuelve a revisar los comprobantes en espera y avisa por WhatsApp los que se confirmen.</p>
     <div class="fila-form"><input type="file" id="fCartola" accept=".csv,.xlsx,.txt"><button class="b" id="bCartola">Subir cartola</button></div>
     <pre class="res" id="rCartola" hidden></pre>
+    <h2>Respaldo de archivos</h2>
+    <p class="ayuda">Los archivos que llegan por WhatsApp se conservan 180 días. Al día 170 se envían por correo a alertas@huno.cl y al día 180 se borran (solo si ya se respaldaron). Esto corre solo cada mañana; aquí puedes probar el envío o correrlo ahora.</p>
+    <div class="fila-form"><button class="b sec" id="bRespPrueba">Enviar correo de prueba</button><button class="b sec" id="bResp">Respaldar ahora</button></div>
+    <pre class="res" id="rResp" hidden></pre>
   </section>
 
   <section id="t-clientes">
@@ -181,6 +185,7 @@
       ['confirmados_24h', 'Pagos confirmados (24 h)'],
       ['pendientes_banco', 'Esperando banco'],
       ['esperando_rut', 'Esperando RUT'],
+      ['esperando_empresa', 'Esperando empresa'],
       ['confirmados_sin_avisar', 'Confirmados sin avisar', r.confirmados_sin_avisar > 0],
       ['facturas_pendientes', 'Facturas pendientes (Finanzas)'],
       ['clientes_con_telefono', 'Clientes con teléfono'],
@@ -279,6 +284,12 @@
   $('inToken').addEventListener('keydown', e => { if (e.key === 'Enter') entrar(); });
   $('salir').onclick = salir;
   $('bCartola').onclick = () => subir('fCartola', '/admin/api/cartola', 'rCartola');
+  async function respaldo(ruta) {
+    const r = $('rResp'); r.hidden = false; r.textContent = 'Enviando…';
+    try { r.textContent = JSON.stringify(await post(ruta), null, 2); } catch (e) { r.textContent = 'Error: ' + e.message; }
+  }
+  $('bRespPrueba').onclick = () => respaldo('/admin/api/respaldo/prueba');
+  $('bResp').onclick = () => respaldo('/admin/api/respaldo');
   let clientesCache = [];
   function pintarClientes() {
     const q = ($('buscarCli').value || '').toLowerCase().replace(/[.\s+-]/g, '');

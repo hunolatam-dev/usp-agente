@@ -37,6 +37,9 @@ def reglas() -> dict:
         "dias_espera_banco": 3,
         "monto_maximo_auto": 3_000_000,
         "pausa_humano_horas": 12,
+        "pago_varias_facturas": True,
+        "horas_sin_respuesta": 6,
+        "max_consultas_ia_hora": 30,
     }
     base.update(negocio().get("reglas") or {})
     return base
@@ -52,13 +55,43 @@ def cuentas_destino() -> list[str]:
     return finales
 
 
+def rut_propio() -> str | None:
+    """RUT de HUNO (titular de la cuenta): nunca es el RUT de un cliente."""
+    from agent.utils import normalizar_rut
+
+    return normalizar_rut(_valor(negocio(), "datos_transferencia.rut"))
+
+
 def _valor(datos: dict, ruta: str) -> str:
     actual = datos
     for parte in ruta.split("."):
         if not isinstance(actual, dict):
             return ""
         actual = actual.get(parte)
+    if isinstance(actual, list):
+        return "\n".join(f"- {x}" for x in actual)
     return "" if actual is None else str(actual)
+
+
+def _formatear_monto(n) -> str:
+    try:
+        return "$" + f"{int(n):,}".replace(",", ".")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _derivados(datos: dict) -> dict:
+    """Valores calculados que el prompt usa como {{calculado.*}}."""
+    url = str(datos.get("cotizador_url") or "").strip()
+    desde = _formatear_monto(datos.get("precio_desde"))
+    if url:
+        cotizacion = (f"El cliente cotiza su plan en {url}: indica qué necesita y recibe el valor mensual "
+                      "en su correo. Entrega ese enlace.")
+    else:
+        cotizacion = ("El cotizador en línea aún no está disponible. Ofrece que un ejecutivo le prepare la "
+                      "cotización y, si acepta, usa escalar_a_persona con motivo \"cotizacion\" y en el resumen "
+                      "anota qué servicios le interesan, la empresa y un correo si lo dio.")
+    return {"calculado": {"precio_desde": desde, "cotizacion": cotizacion}}
 
 
 def _knowledge() -> str:
@@ -76,14 +109,31 @@ def _knowledge() -> str:
 @lru_cache
 def system_prompt() -> str:
     plantilla = prompts().get("system_prompt", "")
-    datos = negocio()
+    datos = {**negocio(), **_derivados(negocio())}
     texto = re.sub(r"\{\{\s*([\w.]+)\s*\}\}", lambda m: _valor(datos, m.group(1)), plantilla)
     return (texto.rstrip() + "\n\n" + _knowledge()).strip()
 
 
+# Respuestas que pueden faltar a proposito (el codigo revisa si existen)
+_OPCIONALES = {"saludo_conocido", "confirmado_varias", "servicios_cotizador", "recordar_empresa", "recordar_rut"}
+_RESPALDO = "Recibí su mensaje. Un ejecutivo de USP le responderá {cuando}."
+
+
 def respuesta(clave: str, **campos) -> str:
-    plantilla = (prompts().get("respuestas") or {}).get(clave, "")
+    plantilla = (prompts().get("respuestas") or {}).get(clave, "") or ""
+    if not plantilla.strip() and clave not in _OPCIONALES:
+        # Si alguien borra una respuesta de prompts.yaml, el cliente igual recibe algo
+        logger.warning(f"Falta la respuesta '{clave}' en config/prompts.yaml; se usa una generica")
+        plantilla = _RESPALDO
     campos.setdefault("horario", _valor(negocio(), "negocio.horario"))
+    if "{cuando}" in plantilla and "cuando" not in campos:
+        from agent import horario
+
+        campos["cuando"] = horario.cuando_responde()
+    if "{" in plantilla:
+        datos = {**negocio(), **_derivados(negocio())}
+        for clave_dato in re.findall(r"\{\{\s*([\w.]+)\s*\}\}", plantilla):
+            plantilla = plantilla.replace("{{" + clave_dato + "}}", _valor(datos, clave_dato).replace("{", "(").replace("}", ")"))
     try:
         return plantilla.format(**campos)
     except (KeyError, IndexError):

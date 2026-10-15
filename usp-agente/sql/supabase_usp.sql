@@ -25,8 +25,11 @@ CREATE TABLE IF NOT EXISTS usp_conversaciones (
 	ultimo_entrante_en TIMESTAMP WITH TIME ZONE, 
 	pausado_hasta TIMESTAMP WITH TIME ZONE, 
 	rut_declarado VARCHAR(12), 
+	registro TEXT, 
 	PRIMARY KEY (telefono)
 );
+-- Agregada en oct-2026 (registro del numero por WhatsApp). El agente tambien la agrega solo al arrancar.
+ALTER TABLE usp_conversaciones ADD COLUMN IF NOT EXISTS registro TEXT;
 
 ALTER TABLE usp_conversaciones ENABLE ROW LEVEL SECURITY;
 
@@ -97,9 +100,12 @@ CREATE TABLE IF NOT EXISTS usp_comprobantes (
 	notificado BOOLEAN NOT NULL, 
 	creado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
 	actualizado_en TIMESTAMP WITH TIME ZONE NOT NULL, 
+	respaldado_en TIMESTAMP WITH TIME ZONE, 
 	PRIMARY KEY (id), 
 	FOREIGN KEY(movimiento_id) REFERENCES usp_movimientos (id)
 );
+-- Agregada en oct-2026 (respaldo por correo de archivos antiguos). El agente tambien la agrega solo al arrancar.
+ALTER TABLE usp_comprobantes ADD COLUMN IF NOT EXISTS respaldado_en TIMESTAMP WITH TIME ZONE;
 
 CREATE INDEX IF NOT EXISTS ix_usp_comprobantes_creado_en ON usp_comprobantes (creado_en);
 CREATE INDEX IF NOT EXISTS ix_usp_comprobantes_estado ON usp_comprobantes (estado);

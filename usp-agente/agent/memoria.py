@@ -42,6 +42,27 @@ async def guardar_turno(telefono: str, usuario: str, asistente: str):
         await s.commit()
 
 
+async def guardar_mensaje(telefono: str, role: str, contenido: str):
+    """Un mensaje suelto (lo que escribe el cliente mientras atiende un ejecutivo, o lo que responde el ejecutivo)."""
+    if not (contenido or "").strip():
+        return
+    async with async_session() as s:
+        s.add(Mensaje(telefono=telefono, role=role, content=contenido[:4000], creado_en=ahora()))
+        await s.commit()
+
+
+def fusionar(mensajes: list[dict]) -> list[dict]:
+    """La API exige turnos alternados user/assistant: se juntan los consecutivos del mismo rol."""
+    salida: list[dict] = []
+    for m in mensajes:
+        if salida and salida[-1]["role"] == m["role"] and isinstance(m["content"], str) \
+                and isinstance(salida[-1]["content"], str):
+            salida[-1] = {"role": m["role"], "content": salida[-1]["content"] + "\n" + m["content"]}
+        else:
+            salida.append(dict(m))
+    return salida
+
+
 async def obtener_historial(telefono: str, limite: int = 12) -> list[dict]:
     async with async_session() as s:
         filas = (
@@ -52,7 +73,19 @@ async def obtener_historial(telefono: str, limite: int = 12) -> list[dict]:
     filas = list(reversed(filas))
     while filas and filas[0].role != "user":
         filas.pop(0)
-    return [{"role": f.role, "content": f.content} for f in filas]
+    return fusionar([{"role": f.role, "content": f.content} for f in filas])
+
+
+async def ultimo_del_asistente(telefono: str, despues_de=None) -> str:
+    """Ultima respuesta guardada para este numero (opcionalmente, solo si es posterior a `despues_de`)."""
+    async with async_session() as s:
+        q = select(Mensaje).where(Mensaje.telefono == telefono, Mensaje.role == "assistant")
+        fila = (await s.execute(q.order_by(Mensaje.id.desc()).limit(1))).scalars().first()
+    if fila is None:
+        return ""
+    if despues_de is not None and como_utc(fila.creado_en) < como_utc(despues_de):
+        return ""
+    return fila.content or ""
 
 
 async def registrar_entrante(telefono: str, contexto: dict, nombre: str | None) -> Conversacion:
@@ -76,6 +109,20 @@ async def registrar_entrante(telefono: str, contexto: dict, nombre: str | None) 
 async def obtener_conversacion(telefono: str) -> Conversacion | None:
     async with async_session() as s:
         return await s.get(Conversacion, telefono)
+
+
+async def segundos_desde_entrante(telefono: str, conversation_id: str | None = None) -> float | None:
+    async with async_session() as s:
+        conv = None
+        if conversation_id:
+            conv = (await s.execute(
+                select(Conversacion).where(Conversacion.conversation_id == conversation_id)
+            )).scalars().first()
+        if conv is None and telefono:
+            conv = await s.get(Conversacion, telefono)
+    if conv is None or conv.ultimo_entrante_en is None:
+        return None
+    return (ahora() - como_utc(conv.ultimo_entrante_en)).total_seconds()
 
 
 async def esta_pausada(telefono: str) -> bool:

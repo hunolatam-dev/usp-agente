@@ -3,9 +3,9 @@ import logging
 import os
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from agent.db import Escalamiento, async_session
+from agent.db import Escalamiento, ahora, async_session
 
 logger = logging.getLogger("usp")
 
@@ -25,6 +25,11 @@ MOTIVOS = {
     "sin_movimiento": "El pago no aparece en el banco después del plazo de espera",
     "conflicto": "La factura o el movimiento cambió mientras se confirmaba",
     "error_lectura": "No se pudo descargar o leer el archivo",
+    "documento_recibido": "Archivo que no es un comprobante: revisar o traspasar al área",
+    "cliente_no_respondio": "El cliente no indicó el RUT o la empresa de su comprobante",
+    "cotizacion": "Quiere cotizar un plan o servicio",
+    "error_tecnico": "Falla técnica del agente: responder al cliente",
+    "registro_whatsapp": "El cliente registró su número por WhatsApp (validado con código al correo)",
 }
 
 
@@ -50,6 +55,36 @@ async def crear(telefono: str, motivo: str, resumen: str = "", comprobante_id: i
         await s.commit()
     await notificar(esc)
     return esc
+
+
+async def registrar_hecho(telefono: str, motivo: str, resumen: str) -> Escalamiento:
+    """Deja constancia en los casos (ya resuelto): algo que hizo el agente y que el equipo debe poder ver."""
+    async with async_session() as s:
+        esc = Escalamiento(telefono=telefono, motivo=motivo, resumen=resumen[:4000], estado="resuelto",
+                           resuelto_en=ahora(), resuelto_por="Agente WhatsApp USP", nota_resolucion="Automático")
+        s.add(esc)
+        await s.commit()
+    return esc
+
+
+async def resolver_de_comprobante(comprobante_id: int, nota: str, quien: str = "Agente WhatsApp USP") -> int:
+    """Cierra los casos abiertos de un comprobante que el sistema termino confirmando."""
+    async with async_session() as s:
+        r = await s.execute(
+            update(Escalamiento)
+            .where(Escalamiento.comprobante_id == comprobante_id, Escalamiento.estado == "abierto")
+            .values(estado="resuelto", resuelto_en=ahora(), resuelto_por=quien, nota_resolucion=nota)
+        )
+        await s.commit()
+        return r.rowcount or 0
+
+
+async def abiertos(telefono: str, limite: int = 3) -> list[Escalamiento]:
+    async with async_session() as s:
+        return list((await s.execute(
+            select(Escalamiento).where(Escalamiento.telefono == telefono, Escalamiento.estado == "abierto")
+            .order_by(Escalamiento.id.desc()).limit(limite)
+        )).scalars().all())
 
 
 async def notificar(esc: Escalamiento):

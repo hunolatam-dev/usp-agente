@@ -26,6 +26,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    inspect,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -127,6 +129,8 @@ class Conversacion(Base):
     pausado_hasta: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # RUT que el cliente escribio en el chat (NO da acceso a ver deudas)
     rut_declarado: Mapped[str | None] = mapped_column(String(12))
+    # Registro del numero en la ficha del cliente (JSON con el paso en curso, ver agent/registro.py)
+    registro: Mapped[str | None] = mapped_column(Text)
 
 
 # ── Datos de app.huno.cl (tablas que YA existen en Supabase) ─────────────
@@ -236,6 +240,8 @@ class Comprobante(Base):
     notificado: Mapped[bool] = mapped_column(Boolean, default=False)
     creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora, index=True)
     actualizado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
+    # Cuando se envio el archivo por correo como respaldo (antes de borrarlo, ver agent/respaldo.py)
+    respaldado_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Pago(Base):
@@ -275,6 +281,23 @@ class Escalamiento(Base):
     nota_resolucion: Mapped[str | None] = mapped_column(Text)
 
 
+# Columnas agregadas despues de la primera version. create_all() no altera tablas que ya
+# existen, asi que se agregan aqui (en Supabase tambien estan en sql/supabase_usp.sql).
+_COLUMNAS_NUEVAS = [
+    ("usp_comprobantes", "respaldado_en", "TIMESTAMP WITH TIME ZONE"),
+    ("usp_conversaciones", "registro", "TEXT"),
+]
+
+
+def _migrar(conn):
+    nombres = set(inspect(conn).get_table_names())
+    for tabla, columna, tipo in _COLUMNAS_NUEVAS:
+        if tabla in nombres and columna not in {c["name"] for c in inspect(conn).get_columns(tabla)}:
+            logger.info(f"Agregando columna {tabla}.{columna}")
+            conn.execute(text(f"ALTER TABLE {tabla} ADD COLUMN {columna} {tipo}"))
+
+
 async def inicializar_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrar)

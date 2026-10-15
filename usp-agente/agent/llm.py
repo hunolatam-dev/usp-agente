@@ -20,7 +20,13 @@ _soporta_esfuerzo = True
 def cliente() -> AsyncAnthropic:
     global _cliente
     if _cliente is None:
-        _cliente = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        clave = (os.getenv("ANTHROPIC_API_KEY") or "").strip().strip("'\"")
+        # Las claves de usuario (sk-ant-usr-...) no estan ligadas a un workspace y exigen indicarlo
+        espacio = (os.getenv("ANTHROPIC_WORKSPACE_ID") or "").strip()
+        extra = {"default_headers": {"anthropic-workspace-id": espacio}} if espacio else {}
+        # Sin limite, una llamada colgada deja al cliente esperando minutos: se corta y se deriva
+        _cliente = AsyncAnthropic(api_key=clave, timeout=float(os.getenv("ANTHROPIC_TIMEOUT") or 60),
+                                  max_retries=2, **extra)
     return _cliente
 
 

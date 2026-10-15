@@ -10,6 +10,9 @@ os.environ["ENVIRONMENT"] = "test"
 os.environ["ADMIN_TOKEN"] = "token-de-prueba-123456"
 os.environ.pop("ANTHROPIC_API_KEY", None)
 os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+os.environ["AGRUPAR_SEGUNDOS"] = "0"          # sin esperar a que el cliente siga escribiendo
+os.environ["ESPERA_CLASIFICAR_SALIENTE"] = "0"
+os.environ["REVISION_PERIODICA"] = "0"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest  # noqa: E402

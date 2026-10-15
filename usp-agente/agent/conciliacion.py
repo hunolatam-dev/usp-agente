@@ -9,7 +9,9 @@ Toda la decision es deterministica. Un pago se confirma solo si TODO esto se cum
   5. Se sabe a que cliente corresponde: telefono registrado en la ficha del cliente en
      app.huno.cl, RUT escrito en el chat o RUT de origen de la transferencia.
   6. Hay una factura pendiente (Finanzas de app.huno.cl) de ese cliente con saldo EXACTO
-     igual al monto (si hay varias del mismo monto, se paga la mas antigua).
+     igual al monto (si hay varias del mismo monto, se paga la mas antigua). Si ninguna calza
+     sola, se acepta que el monto sea la suma exacta de sus facturas pendientes MAS ANTIGUAS
+     (reglas.pago_varias_facturas): todas esas quedan pagadas con la misma transferencia.
   7. Hay UNA transferencia en el banco por ese monto, en el rango de fechas, aun no usada.
 
 Si falta solo el banco (paso 7) y el comprobante es reciente, queda "pendiente_banco" y se
@@ -48,6 +50,7 @@ class Resultado:
     rut: str | None = None
     saldo: int | None = None  # solo para "abono": lo que queda por pagar
     opciones: str = ""        # solo para "esperando_empresa": lista numerada
+    cantidad: int = 1         # facturas pagadas con este comprobante
 
     def mensaje(self) -> str:
         campos = {
@@ -60,7 +63,48 @@ class Resultado:
         }
         if self.estado == "escalado" and not self.monto:
             return config.respuesta("recibido_revision")
+        if self.estado == "confirmado" and self.cantidad > 1 and config.respuesta("confirmado_varias"):
+            return config.respuesta("confirmado_varias", **campos)
         return config.respuesta(self.estado, **campos)
+
+
+def unir_folios(folios: list[str]) -> str:
+    """["1501", "1502", "1503"] -> "1501, 1502 y 1503"."""
+    folios = [f for f in folios if f]
+    if len(folios) <= 1:
+        return folios[0] if folios else ""
+    return ", ".join(folios[:-1]) + " y " + folios[-1]
+
+
+def calces(pendientes: list[huno.FacturaPendiente], monto: int | None,
+           permitir_varias: bool | None = None) -> dict[int, list[huno.FacturaPendiente]]:
+    """
+    Por cliente, las facturas que este monto paga EXACTO: la mas antigua con ese saldo o, si no
+    hay, las k mas antiguas (k >= 2) cuya suma es el monto. `pendientes` viene ordenado por antiguedad.
+    """
+    if not monto:
+        return {}
+    if permitir_varias is None:
+        permitir_varias = bool(config.reglas().get("pago_varias_facturas", True))
+    por_cliente: dict[int, list[huno.FacturaPendiente]] = {}
+    for f in pendientes:
+        por_cliente.setdefault(f.cliente_id, []).append(f)
+    salida = {}
+    for cid, fs in por_cliente.items():
+        exacta = next((f for f in fs if f.saldo == monto), None)
+        if exacta:
+            salida[cid] = [exacta]
+            continue
+        if permitir_varias:
+            suma = 0
+            for i, f in enumerate(fs):
+                suma += f.saldo
+                if suma == monto and i >= 1:
+                    salida[cid] = fs[: i + 1]
+                    break
+                if suma > monto:
+                    break
+    return salida
 
 
 PREFIJO_ELEGIDA = "empresa_elegida:"
@@ -82,20 +126,33 @@ async def candidatos(s, comp: Comprobante) -> list[huno.Cliente]:
 
 
 async def opciones_empresa(s, comp: Comprobante) -> list[huno.Cliente]:
-    """Empresas del telefono que tienen una factura pendiente por el monto del comprobante."""
+    """Empresas del telefono con facturas pendientes que el monto del comprobante paga exacto."""
     del_telefono = await huno.clientes_de_telefono(comp.telefono)
-    con_monto = {f.cliente_id for f in await huno.facturas_pendientes(s, [c.id for c in del_telefono])
-                 if f.saldo == comp.monto}
+    con_monto = set(calces(await huno.facturas_pendientes(s, [c.id for c in del_telefono]), comp.monto))
     return sorted([c for c in del_telefono if c.id in con_monto], key=lambda c: c.nombre.lower())
 
 
+async def marcar_notificado(comprobante_id: int):
+    async with async_session() as s:
+        c = await s.get(Comprobante, comprobante_id)
+        if c is not None:
+            c.notificado = True
+            await s.commit()
+
+
 async def elegir_empresa(comprobante_id: int, cliente_id: int) -> Resultado:
-    """El cliente respondio a cual empresa corresponde el pago: se vuelve a evaluar solo con esa."""
+    """
+    El cliente respondio a cual empresa corresponde el pago: se vuelve a evaluar solo con esa.
+    El resultado se le dice en la misma respuesta, asi que un pago confirmado queda avisado.
+    """
     async with async_session() as s:
         comp = await s.get(Comprobante, comprobante_id)
         comp.estado, comp.motivo, comp.actualizado_en = "recibido", f"{PREFIJO_ELEGIDA}{cliente_id}", ahora()
         await s.commit()
-    return await evaluar(comprobante_id)
+    res = await evaluar(comprobante_id)
+    if res.estado == "confirmado":
+        await marcar_notificado(comprobante_id)
+    return res
 
 
 def _cuenta_destino_ok(comp: Comprobante) -> bool:
@@ -129,6 +186,23 @@ async def _escalar(s, comp: Comprobante, motivo: str, detalle: str = "") -> Resu
     return Resultado("escalado", motivo, comp.monto)
 
 
+async def escalar(comprobante_id: int, motivo: str, detalle: str = "") -> Resultado:
+    async with async_session() as s:
+        comp = await s.get(Comprobante, comprobante_id)
+        return await _escalar(s, comp, motivo, detalle)
+
+
+async def resultado_confirmado(s, comp: Comprobante) -> Resultado:
+    """Resultado de un comprobante ya confirmado (una o varias facturas)."""
+    ids = list((await s.execute(
+        select(Pago.factura_id).where(Pago.comprobante_id == comp.id).order_by(Pago.id)
+    )).scalars().all()) or ([comp.factura_id] if comp.factura_id else [])
+    facturas = [f for f in [await huno.factura(s, i) for i in dict.fromkeys(ids)] if f is not None]
+    cli = await huno.cliente_por_id(facturas[0].cliente_id) if facturas and facturas[0].cliente_id else None
+    return Resultado("confirmado", "", comp.monto, unir_folios([huno.folio_de(f) for f in facturas]),
+                     cli.nombre if cli else None, cli.rut if cli else None, cantidad=max(len(facturas), 1))
+
+
 async def evaluar(comprobante_id: int) -> Resultado:
     reglas = config.reglas()
     async with async_session() as s:
@@ -136,10 +210,7 @@ async def evaluar(comprobante_id: int) -> Resultado:
         if comp is None:
             raise ValueError(f"Comprobante {comprobante_id} no existe")
         if comp.estado == "confirmado":
-            fac = await huno.factura(s, comp.factura_id) if comp.factura_id else None
-            cli = await huno.cliente_por_id(fac.cliente_id) if fac and fac.cliente_id else None
-            return Resultado("confirmado", "", comp.monto, huno.folio_de(fac),
-                             cli.nombre if cli else None, cli.rut if cli else None)
+            return await resultado_confirmado(s, comp)
 
         # 1. Legibilidad
         if comp.es_comprobante is False:
@@ -212,25 +283,29 @@ async def evaluar(comprobante_id: int) -> Resultado:
         por_id = {c.id: c for c in clientes}
         ruts = sorted({c.rut for c in clientes if c.rut})
 
-        # 6. Factura con saldo exacto (Finanzas de app.huno.cl)
-        facturas = [f for f in await huno.facturas_pendientes(s, list(por_id)) if f.saldo == comp.monto]
-        if not facturas:
+        # 6. Facturas que el monto paga exacto (Finanzas de app.huno.cl)
+        pendientes = await huno.facturas_pendientes(s, list(por_id))
+        por_cliente = calces(pendientes, comp.monto)
+        if not por_cliente:
             nombres = ", ".join(c.nombre for c in clientes)
             return await _escalar(s, comp, "sin_factura_exacta", f"Clientes revisados: {nombres}")
         # Dos fichas con el mismo RUT cuentan como la misma empresa
-        empresas = {por_id[f.cliente_id].rut or f"id{f.cliente_id}" for f in facturas}
+        empresas = {por_id[cid].rut or f"id{cid}" for cid in por_cliente}
         if len(empresas) > 1:
             del_telefono = {c.id for c in await huno.clientes_de_telefono(comp.telefono)}
-            if {f.cliente_id for f in facturas} <= del_telefono:
+            if set(por_cliente) <= del_telefono:
                 # Son empresas de la misma persona: se le pregunta a cual corresponde el pago
                 opciones = await opciones_empresa(s, comp)
                 comp.estado, comp.motivo, comp.actualizado_en = "esperando_empresa", "", ahora()
                 await s.commit()
                 return Resultado("esperando_empresa", "", comp.monto, opciones=huno.lista_opciones(opciones))
             return await _escalar(s, comp, "factura_ambigua",
-                                  "Clientes con ese monto: " + ", ".join(sorted({por_id[f.cliente_id].nombre for f in facturas})))
-        factura = facturas[0]
-        cliente = por_id[factura.cliente_id]
+                                  "Clientes con ese monto: " + ", ".join(sorted({por_id[c].nombre for c in por_cliente})))
+        # La misma empresa (una o dos fichas con el mismo RUT): la factura mas antigua manda
+        cliente_id = min(por_cliente, key=lambda c: pendientes.index(por_cliente[c][0]))
+        a_pagar = por_cliente[cliente_id]
+        cliente = por_id[cliente_id]
+        folios = unir_folios([f.folio for f in a_pagar])
 
         # 7. Movimiento en el banco
         desde = comp.fecha - timedelta(days=int(reglas["dias_antes"]))
@@ -251,7 +326,7 @@ async def evaluar(comprobante_id: int) -> Resultado:
                 comp.estado, comp.motivo, comp.actualizado_en = "pendiente_banco", eleccion, ahora()
                 await s.commit()
                 return Resultado("pendiente_banco", "", comp.monto)
-            return await _escalar(s, comp, "sin_movimiento", f"Factura candidata: N° {factura.folio}")
+            return await _escalar(s, comp, "sin_movimiento", f"Factura(s) candidata(s): N° {folios}")
 
         movimiento = None
         por_operacion = [m for m in movs if _coincide_operacion(m, comp.numero_operacion)]
@@ -282,13 +357,14 @@ async def evaluar(comprobante_id: int) -> Resultado:
             )
             if rm.rowcount != 1:
                 raise IntegrityError("movimiento usado", None, None)
-            ok, restante = await huno.aplicar_pago(s, factura.id, comp.monto, movimiento.fecha, huno.USUARIO_AGENTE)
-            if not ok or restante != 0:
-                raise IntegrityError("factura cambio", None, None)
-            s.add(Pago(factura_id=factura.id, movimiento_id=movimiento.id, comprobante_id=comp.id,
-                       monto=comp.monto, origen="agente"))
+            for f in a_pagar:
+                ok, restante = await huno.aplicar_pago(s, f.id, f.saldo, movimiento.fecha, huno.USUARIO_AGENTE)
+                if not ok or restante != 0:
+                    raise IntegrityError("factura cambio", None, None)
+                s.add(Pago(factura_id=f.id, movimiento_id=movimiento.id, comprobante_id=comp.id,
+                           monto=f.saldo, origen="agente"))
             comp.estado, comp.motivo = "confirmado", ""
-            comp.factura_id, comp.movimiento_id = factura.id, movimiento.id
+            comp.factura_id, comp.movimiento_id = a_pagar[0].id, movimiento.id
             comp.actualizado_en = ahora()
             await s.commit()
         except IntegrityError:
@@ -296,8 +372,10 @@ async def evaluar(comprobante_id: int) -> Resultado:
             comp = await s.get(Comprobante, comprobante_id)
             return await _escalar(s, comp, "conflicto")
 
-        logger.info(f"Pago confirmado: comprobante #{comp.id} -> factura {factura.folio} / movimiento #{movimiento.id}")
-        return Resultado("confirmado", "", comp.monto, factura.folio, cliente.nombre, cliente.rut)
+        logger.info(f"Pago confirmado: comprobante #{comp.id} -> factura(s) {folios} / movimiento #{movimiento.id}")
+    # Si una persona tenia el caso (p. ej. el cliente no respondia), se cierra solo
+    await escalamientos.resolver_de_comprobante(comprobante_id, f"Confirmado automáticamente: factura(s) N° {folios}")
+    return Resultado("confirmado", "", comp.monto, folios, cliente.nombre, cliente.rut, cantidad=len(a_pagar))
 
 
 async def reevaluar_pendientes(telefono: str | None = None, estados=("pendiente_banco", "esperando_rut")) -> list[tuple[Comprobante, Resultado]]:

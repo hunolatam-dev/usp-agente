@@ -8,7 +8,7 @@ import json
 
 from sqlalchemy import select
 
-from agent import conciliacion, escalamientos, huno, memoria
+from agent import conciliacion, config, escalamientos, huno, memoria
 from agent.db import Comprobante, async_session, hoy_chile
 from agent.utils import formatear_monto, formatear_rut, normalizar_rut
 
@@ -45,13 +45,39 @@ DEFINICIONES = [
         },
     },
     {
-        "name": "escalar_a_persona",
-        "description": "Deriva la conversacion a un ejecutivo de USP. Usala cuando el cliente lo pida, cuando no "
-        "puedas resolver con tus herramientas o informacion, ante reclamos, o si el telefono no esta registrado.",
+        "name": "registrar_telefono",
+        "description": "El cliente quiere registrar este numero de WhatsApp en su empresa y dio el RUT de la empresa "
+        "y el correo registrado en HUNO. El sistema valida los datos y sigue el registro (pide su nombre y le envia un "
+        "codigo al correo). Transmite tal cual el mensaje que devuelve.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "motivo": {"type": "string", "enum": ["pedido_cliente", "registro_contacto", "consulta", "reclamo"]},
+                "rut": {"type": "string", "description": "RUT de la empresa, ej 76.123.456-7"},
+                "correo": {"type": "string", "description": "Correo que dio el cliente"},
+            },
+            "required": ["rut", "correo"],
+        },
+    },
+    {
+        "name": "elegir_empresa_comprobante",
+        "description": "Cuando hay un comprobante esperando que el cliente indique a cual de sus empresas corresponde "
+        "el pago (aparece en 'Quien escribe') y el cliente responde, pasa su respuesta. El sistema valida el pago; "
+        "transmite el mensaje que devuelve tal cual.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"empresa": {"type": "string", "description": "Numero de opcion, RUT o nombre que dio el cliente"}},
+            "required": ["empresa"],
+        },
+    },
+    {
+        "name": "escalar_a_persona",
+        "description": "Deriva la conversacion a un ejecutivo de USP. Usala cuando el cliente lo pida, cuando no "
+        "puedas resolver con tus herramientas o informacion, ante reclamos, si el telefono no esta registrado y pide "
+        "datos de su cuenta, o si quiere una cotizacion (motivo cotizacion).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "motivo": {"type": "string", "enum": ["pedido_cliente", "registro_contacto", "consulta", "reclamo", "cotizacion"]},
                 "resumen": {"type": "string", "description": "Resumen breve del caso para el ejecutivo"},
             },
             "required": ["motivo", "resumen"],
@@ -74,7 +100,10 @@ ETIQUETAS = {
 async def consultar_facturas_pendientes(telefono: str, empresa: str | None = None) -> dict:
     clientes = sorted(await huno.clientes_de_telefono(telefono), key=lambda c: c.nombre.lower())
     if not clientes:
-        return {"resultado": "telefono_no_registrado"}
+        from agent import registro
+
+        return {"resultado": "telefono_no_registrado", "mensaje_para_el_cliente": await registro.invitacion(telefono),
+                "instruccion": "No muestres deudas. Transmite este mensaje tal cual."}
     if len(clientes) > 1 and (empresa or "").strip().lower() not in ("todas", "todos", "all"):
         elegido = huno.elegir(empresa, clientes) if empresa else None
         if elegido is None:
@@ -123,8 +152,8 @@ async def estado_comprobantes(telefono: str) -> dict:
             item = {"enviado": c.creado_en.date().isoformat() if c.creado_en else None,
                     "monto": formatear_monto(c.monto) if c.monto else None,
                     "estado": ETIQUETAS.get(c.estado, c.estado)}
-            if c.estado == "confirmado" and c.factura_id:
-                item["factura"] = huno.folio_de(await huno.factura(s, c.factura_id))
+            if c.estado == "confirmado":
+                item["factura"] = (await conciliacion.resultado_confirmado(s, c)).folio
             salida.append(item)
     return {"comprobantes": salida} if salida else {"comprobantes": [], "nota": "No hay comprobantes recibidos desde este telefono"}
 
@@ -133,8 +162,14 @@ async def registrar_rut_empresa(telefono: str, rut: str) -> dict:
     rut_ok = normalizar_rut(rut)
     if not rut_ok:
         return {"resultado": "rut_invalido"}
+    if rut_ok == config.rut_propio():
+        return {"resultado": "rut_de_huno", "instruccion": "Ese es el RUT de HUNO (a quien se transfiere). "
+                "Pide el RUT de la empresa que esta pagando."}
     await memoria.guardar_rut_declarado(telefono, rut_ok)
     resultados = await conciliacion.reevaluar_pendientes(telefono, estados=("esperando_rut",))
+    for comp, r in resultados:
+        if r.estado == "confirmado":
+            await conciliacion.marcar_notificado(comp.id)  # se le dice en esta misma respuesta
     return {
         "resultado": "rut_registrado",
         "rut": formatear_rut(rut_ok),
@@ -143,9 +178,30 @@ async def registrar_rut_empresa(telefono: str, rut: str) -> dict:
     }
 
 
+async def elegir_empresa_comprobante(telefono: str, empresa: str) -> dict:
+    async with async_session() as s:
+        comp = (await s.execute(
+            select(Comprobante).where(Comprobante.telefono == telefono, Comprobante.estado == "esperando_empresa")
+            .order_by(Comprobante.id)
+        )).scalars().first()
+        if comp is None:
+            return {"resultado": "sin_comprobantes_en_espera"}
+        opciones = await conciliacion.opciones_empresa(s, comp)
+    elegido = huno.elegir(empresa, opciones) if opciones else None
+    if elegido is None:
+        return {"resultado": "no_coincide", "opciones": huno.lista_opciones(opciones),
+                "instruccion": "Muestra las opciones y pide que responda con el numero."}
+    r = await conciliacion.elegir_empresa(comp.id, elegido.id)
+    return {"resultado": r.estado, "mensaje_para_el_cliente": r.mensaje(),
+            "instruccion": "Transmite este mensaje tal cual, sin agregar datos."}
+
+
 async def escalar_a_persona(telefono: str, motivo: str, resumen: str) -> dict:
     esc = await escalamientos.crear(telefono, motivo, resumen)
-    return {"resultado": "derivado", "caso": esc.id}
+    from agent import horario
+
+    return {"resultado": "derivado", "caso": esc.id, "responde": horario.cuando_responde(),
+            "instruccion": "Dile al cliente que un ejecutivo le respondera por este chat " + horario.cuando_responde() + "."}
 
 
 async def ejecutar(nombre: str, entrada: dict, telefono: str) -> str:
@@ -156,6 +212,14 @@ async def ejecutar(nombre: str, entrada: dict, telefono: str) -> str:
             r = await estado_comprobantes(telefono)
         elif nombre == "registrar_rut_empresa":
             r = await registrar_rut_empresa(telefono, str(entrada.get("rut", "")))
+        elif nombre == "registrar_telefono":
+            from agent import registro
+
+            r = {"mensaje_para_el_cliente": await registro.validar_datos(
+                telefono, str(entrada.get("rut", "")), str(entrada.get("correo", ""))),
+                "instruccion": "Transmite este mensaje tal cual."}
+        elif nombre == "elegir_empresa_comprobante":
+            r = await elegir_empresa_comprobante(telefono, str(entrada.get("empresa", "")))
         elif nombre == "escalar_a_persona":
             motivo = entrada.get("motivo") if entrada.get("motivo") in escalamientos.MOTIVOS else "consulta"
             r = await escalar_a_persona(telefono, motivo, str(entrada.get("resumen", ""))[:2000])

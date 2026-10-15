@@ -6,26 +6,52 @@ Basado en [WhatsApp AgentKit](https://github.com/Hainrixz/whatsapp-agentkit) (MI
 
 ## Cómo decide
 
+**Todo mensaje recibe respuesta.** Si algo falla (la IA, la base, WhatsApp), el cliente recibe un aviso y el caso queda abierto para una persona.
+
 | El cliente… | El agente… |
 |---|---|
-| Saluda o agradece | Responde con un texto fijo, sin llamar a la IA |
-| Pregunta cuánto debe | Muestra sus facturas de Finanzas (app.huno.cl), pero solo si su teléfono está en la ficha del cliente en app.huno.cl |
+| Saluda, agradece, pide datos de transferencia, horario o servicios, o pide hablar con una persona | Responde con un texto fijo, **sin llamar a la IA** |
+| Pregunta cuánto debe | Muestra sus facturas de Finanzas (app.huno.cl), pero solo si su teléfono está en la ficha del cliente. Si no, le ofrece registrar el número (ver abajo) |
+| Escribe desde un número que no está en ninguna ficha | Le dice que no se pudo validar el número y le ofrece registrarlo con el RUT de la empresa y el correo registrado |
+| Pregunta por planes o precios | Indica los 5 servicios y que los valores comienzan en $55.000 mensuales. Mientras no exista el cotizador (`cotizador_url`), ofrece que un ejecutivo cotice |
 | Envía un comprobante (imagen o PDF) | La IA lee monto, fecha, N° de operación y cuenta de destino. **El código** decide si el pago se confirma |
-| Escribe desde el celular de USP (ejecutivo) | El agente se calla 12 h en ese chat |
+| Envía otro documento (factura, contrato, Excel, Word…) | Lo guarda y lo deriva a un ejecutivo: puede ser para contabilidad o RRHH |
+| Escribe varios mensajes seguidos | Espera 4 s y responde una sola vez |
+| Escribe mientras atiende un ejecutivo | No responde (sí avisa si se confirma un pago) |
+| Escribe desde el celular de USP o el inbox de Zernio (ejecutivo) | El agente se calla 12 h en ese chat. Las respuestas automáticas de WhatsApp Business (bienvenida/ausencia) **no** lo callan |
+
+Cuando deriva, el mensaje dice **cuándo** responderá un ejecutivo según el horario (`atencion` en `config/business.yaml`, con feriados): "hoy, dentro del horario", "mañana martes a partir de las 9:00 hrs", "el lunes 19 a partir de las 9:00 hrs".
 
 **Un pago se confirma solo si se cumple todo esto:**
 1. El comprobante es legible y no se usó antes (ni el mismo archivo ni el mismo N° de operación).
 2. El monto es ≤ $3.000.000 (configurable).
 3. La cuenta de destino es de HUNO.
 4. Se sabe qué cliente paga: por el teléfono de su ficha en app.huno.cl, por el RUT que escribe el cliente o por el RUT de origen.
-5. Hay una factura pendiente de ese cliente en Finanzas de app.huno.cl por **el saldo exacto** (monto menos abonos). Si hay varias, se paga la más antigua.
+5. Hay una factura pendiente de ese cliente en Finanzas de app.huno.cl por **el saldo exacto** (monto menos abonos). Si hay varias, se paga la más antigua. Si ninguna calza sola pero el monto es **la suma exacta de sus facturas pendientes más antiguas**, se pagan todas esas (`pago_varias_facturas`).
 6. Hay **una** transferencia en la cartola por ese monto, en las fechas del comprobante y sin usar.
 
-Si solo falta que aparezca en el banco, el comprobante queda "esperando banco" y se confirma solo al cargar la cartola, con aviso por WhatsApp. Todo lo demás (pagos parciales, de varias facturas, montos que no calzan, cuenta distinta, comprobante repetido) va al panel como **caso**.
+Si solo falta que aparezca en el banco, el comprobante queda "esperando banco" y se confirma solo al cargar la cartola, con aviso por WhatsApp. Todo lo demás (pagos parciales, montos que no calzan, cuenta distinta, comprobante repetido) va al panel como **caso**.
+
+**Revisión cada 30 minutos** (también desde el panel: `POST /admin/api/revisar`):
+- Reintenta los comprobantes "esperando banco"; si pasan `dias_espera_banco` sin aparecer, abre un caso.
+- Si el cliente no indicó el RUT o la empresa de su comprobante en `horas_sin_respuesta`, abre un caso. Si después responde y se confirma, el caso se cierra solo.
+- Avisa los pagos confirmados que no se pudieron avisar, apenas el cliente vuelve a escribir.
 
 Al confirmar, la factura queda **pagada en Finanzas de app.huno.cl** (`facturas.pagado`, con fecha de pago y usuario "Agente WhatsApp USP"). Un pago parcial confirmado a mano desde el panel queda como **abono** (`facturas_abonos`).
 
 La base de datos impide usar la misma transferencia dos veces, incluso si llegan dos comprobantes al mismo tiempo desde chats distintos.
+
+**Registro del número por el propio cliente** (`agent/registro.py`, sin gastar tokens):
+1. El cliente escribe el RUT de la empresa y el correo registrado. Se cruzan con la ficha en app.huno.cl (`clientes.rut` y `clientes.correos` / `portal_email`).
+2. Si calzan, se le pide su nombre.
+3. Se le envía **el mismo código del Estado de cuenta de huno.cl** (Edge Function `send-otp`, que lo manda al correo registrado de la empresa). Lo escribe en el chat y se valida con `ec_verificar` (5 intentos, vence en 10 minutos). Si no llega, escribe «nuevo código».
+4. Con el código correcto, el número queda en `clientes.telefonos` con el nombre de quien habla (mismo formato que la app) y en los casos resueltos de app.huno.cl queda la constancia. Desde ahí se le saluda por su nombre y se le muestran las facturas de esa empresa.
+
+Límites por número en 24 h: 3 intentos con RUT/correo que no calzan y 3 envíos de código; al superarlos se deriva a un ejecutivo. Un comprobante que esperaba el RUT se confirma al terminar el registro.
+
+**Plazo de pago:** 15 días corridos desde la emisión de la factura (`plazo_pago_dias`). app.huno.cl usa la misma regla en la alerta naranja de Finanzas y en el Reporte de cobranza.
+
+**Archivos recibidos** (comprobantes y documentos): se conservan **180 días corridos**. Al **día 170** se envían por correo a **alertas@huno.cl** como respaldo y al día 180 se borra el archivo (los datos leídos del comprobante se mantienen). Nunca se borra un archivo sin respaldo: si el correo falla, se reintenta cada día y se abre un caso. Como Railway (plan Hobby) bloquea el correo SMTP, el envío pasa por `php/usp_respaldo.php`, que se sube a `huno.cl/api/` y solo puede enviar a alertas@huno.cl. Se configura en `archivos` de `config/business.yaml` y con `RESPALDO_TOKEN` en Railway. Desde el panel: `POST /admin/api/respaldo/prueba` envía un correo de prueba.
 
 ## Puesta en marcha
 
@@ -74,7 +100,7 @@ Para recibir los casos nuevos en Telegram, configura `TELEGRAM_BOT_TOKEN` y `TEL
 ## Desarrollo
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest            # 42 pruebas (SQLite)
+python -m pytest            # 109 pruebas (SQLite)
 TEST_DATABASE_URL=postgresql://... python -m pytest   # contra Postgres
 uvicorn agent.main:app --reload --port 8000
 ```
